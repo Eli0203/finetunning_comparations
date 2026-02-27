@@ -1,0 +1,17 @@
+# virtual environment and Python cache
+.venv/
+__pycache__/
+*.py[oc]
+
+# VS Code and Notebooks
+.vscode/
+.ipynb_checkpoints/
+
+# Results and outputs
+final_model_LoRA/
+output_LoRA/
+results_LoRA/
+finetuning.log
+
+# config files
+.env
