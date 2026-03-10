@@ -1,24 +1,24 @@
 [project]
 name = "finetunning"
 version = "0.1.0"
-description = "Finetuning project with NumPy binary compatibility"
+description = "Production-ready finetuning stack for Python 3.12"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.1.0",
-    "transformers>=4.38.2",  
-    "peft>=0.8.2",          # to >= to allow 0.9.0+ if needed for Py3.12
-    "datasets>=2.16.1",
-    "evaluate>=0.4.1",
-    "accelerate>=0.27.2",
-    "pyarrow>=14.0.1",
-    "scikit-learn>=1.3.0",
-    "pydantic-settings>=2.1.0",
+    "torch>=2.3.0",           # Torch 2.3+ is optimized for NumPy 2.0
+    "transformers>=4.41.0",   # For NumPy 2.0 compatibility
+    "peft>=0.11.0",           # Matches modern transformers/numpy headers
+    "datasets>=2.19.0",       # Required for the new pyarrow integration
+    "evaluate>=0.4.2",        # Latest stable to avoid evaluate/numpy 1.x leaks
+    "accelerate>=0.30.0",
+    "pyarrow>=16.1.0",        # Version 16.1.0 supports NumPy 2.0
+    "scikit-learn>=1.5.0",
+    "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",
-    "bitsandbytes>=0.41.0",
-    "tiktoken",
-    "ipywidgets",
-    "numpy>=1.23.5,<2.0.0", # Explicitly  1.x range to fix dtype size error
+    "bitsandbytes>=0.43.1",
+    "tiktoken>=0.7.0",
+    "ipywidgets>=8.1.0",
+    "numpy>=2.0.0",           # Explicitly move to 2.0 to align all C-headers
 ]
 
 [[tool.uv.index]]
