@@ -1,3 +1,9 @@
+"""
+Memory management Utility
+author: Eliana Vallejo
+"""
+
+
 import psutil
 import torch
 import gc

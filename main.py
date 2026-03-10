@@ -1,3 +1,5 @@
+from unittest import loader
+
 import torch
 from peft import TaskType
 from src.settings.settings import settings
@@ -16,7 +18,8 @@ def main():
     loader = GLUEDataLoader(settings.model_id, settings.task_name)
     evaluator = UnifiedEvaluator(settings.task_name)
     val_loader = loader.get_loader("validation", settings.batch_size)
-    
+    train_ds = loader.dataset["train"].map(loader._tokenize_fn, batched=True)
+    eval_ds = loader.dataset["validation"].map(loader._tokenize_fn, batched=True)
     # 2. Strategy: LoRA / QLoRA Initialization ....
     try:
         base_model = AutoModelForSequenceClassification.from_pretrained(settings.model_id)
@@ -26,16 +29,26 @@ def main():
             settings.lora_rank, settings.lora_alpha, settings.lora_dropout
         )
         model_lora = lora_engine.apply_lora() # 
-
-        # 3. Training Loop (MAP Estimation)
+        model_lora.to(settings.device) 
+        # 3. Training Loop Configuration
         training_args = TrainingArguments(
-            output_dir=f"./results_{settings.task_name}",
+            output_dir=f"{settings.output_dir}_{settings.task_name}",
             num_train_epochs=settings.epochs,
             per_device_train_batch_size=settings.batch_size,
-            device=settings.device # Automatic detection 
+            remove_unused_columns=False,
+            # The 'device' argument is removed as it is not a valid parameter [1]
         )
-        trainer = Trainer(model=model_lora, args=training_args, train_dataset=loader.dataset["train"])
-        trainer.train() 
+
+        # Initialize Trainer with the model already located on the correct device
+        trainer = Trainer(
+            model=model_lora, 
+            args=training_args, 
+            train_dataset=train_ds,
+            eval_dataset=eval_ds,
+            compute_metrics=evaluator.compute_all # Use adjusted UnifiedEvaluator
+        )
+
+        trainer.train()
         # 4. Bayesian Extension: Laplace-LoRA 
         if settings.execute_laplace:
             # We pass the engine to access adapters for curvature estimation

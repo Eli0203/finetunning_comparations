@@ -32,27 +32,27 @@ class LaplaceMath:
     @staticmethod
     def incremental_svd_update(current_B, new_activities, nkfac: int):
         """
-        Algoritmo 1: Estimación eficiente de memoria del factor B de bajo rango.
-        Mantiene BB^T ≈ Σ (g g^T) sin computar la matriz completa.
+        Algorithm 1: Efficient memory estimation of the low-rank factor B.
+        Mantein BB^T ≈ Σ (g g^T) without computing the entire matrix.
         """
-        # Combinar estimación actual con nuevos gradientes/actividades
+        # Combine current estimate with new gradients/activities
         B_prime = torch.cat([current_B, new_activities], dim=1)
-        # SVD para mantener solo los componentes principales nkfac
+        # SVD to maintain only the main components nkfac
         U, S, Vh = torch.linalg.svd(B_prime, full_matrices=False)
         return U[:, :nkfac] @ torch.diag(S[:nkfac])
     
     @staticmethod
     def log_det_kfac_low_rank(L_a, B_b, sigma_sq: float, n_lora: int, d: int):
         """
-        E.2: Optimización de la evidencia usando el Lema del Determinante.
-        Calcula log det(Σ_post^-1) de forma eficiente [3].
+        E.2: Optimizing the evidence using the Determinant Lemma.
+        Calculate log det(Σ_post^-1) eficiently[3].
         """
         # M = (I + σ^2 (L^T L ⊗ B^T B)) 
-        # Reducimos la complejidad de O(D^3) a O((nlora*nkfac)^3)
+        # Reduce complexity  O(D^3) and O((nlora*nkfac)^3)
         LtL = L_a.t() @ L_a
         BtB = B_b.t() @ B_b
         
-        # Producto Kronecker de bloques pequeños
+        # Kronecker small block product
         inner_matrix = torch.kron(LtL, BtB) * sigma_sq
         I_small = torch.eye(inner_matrix.size(0), device=inner_matrix.device)
         
