@@ -1,17 +1,39 @@
 # virtual environment and Python cache
 .venv/
+venv/
 __pycache__/
 *.py[oc]
+*.pyd
+*.egg-info/
+dist/
+build/
 
 # VS Code and Notebooks
 .vscode/
+.idea/
 .ipynb_checkpoints/
+*.swp
 
 # Results and outputs
 final_model_LoRA/
 output_LoRA/
 results_LoRA/
 finetuning.log
-
-# config files
+*.log
+specs/
+# config files — exclude real .env files (contain secrets)
+# .env.example is INTENTIONALLY tracked (template with placeholders)
 .env
+.env.local
+.env.production
+.env.staging
+.env.*.local
+
+# OS and temp files
+.DS_Store
+Thumbs.db
+*.tmp
+
+# Markdown files
+*.md
+!README.md

@@ -1,71 +1,104 @@
-from unittest import loader
-
 import torch
 from peft import TaskType
 from src.settings.settings import settings
 from src.utils.logger import logger
 from src.utils.metrics import UnifiedEvaluator
-from src.utils.memory_manager import MemoryOptimizer
+from src.utils.causal_sampler import CausalWeightSampler
 from src.finetuner.data_loader import GLUEDataLoader
 from src.finetuner.lora_engine import FineTuningEngine as LoRAEngine
-from src.finetuner.laplace_engine import LaplaceLoRAEngine
+from src.finetuner.causal_engine import CausalMonteCLoRAEngine
+from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
+from src.settings.settings import CausalTrainingConfig
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+
 
 def main():
     logger.info("Initializing Fine-tuning Orchestrator...")
-    
-    # 1. Setup Data and Evaluation 
+
+    # 1. Setup Data and Evaluation
     loader = GLUEDataLoader(settings.model_id, settings.task_name)
     evaluator = UnifiedEvaluator(settings.task_name)
-    val_loader = loader.get_loader("validation", settings.batch_size)
+
     train_ds = loader.dataset["train"].map(loader._tokenize_fn, batched=True)
     eval_ds = loader.dataset["validation"].map(loader._tokenize_fn, batched=True)
-    # 2. Strategy: LoRA / QLoRA Initialization ....
+    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "token_type_ids", "label"])
+    eval_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "token_type_ids", "label"])
+
+    train_loader = loader.get_loader("train", settings.batch_size)
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        logits_t = torch.tensor(logits)
+        labels_t = torch.tensor(labels)
+        return evaluator.compute_all(logits_t, labels_t)
+
+    # 2. Strategy: LoRA + Causal orchestration
     try:
         base_model = AutoModelForSequenceClassification.from_pretrained(settings.model_id)
-        # Dependency Injection: Inject configuration into the engine
         lora_engine = LoRAEngine(
-            TaskType.SEQ_CLS, base_model, 
+            TaskType.SEQ_CLS, base_model,
             settings.lora_rank, settings.lora_alpha, settings.lora_dropout
         )
-        model_lora = lora_engine.apply_lora() # 
-        model_lora.to(settings.device) 
+        model_lora = lora_engine.apply_lora()
+        model_lora.to(settings.device)
+
         # 3. Training Loop Configuration
         training_args = TrainingArguments(
             output_dir=f"{settings.output_dir}_{settings.task_name}",
             num_train_epochs=settings.epochs,
             per_device_train_batch_size=settings.batch_size,
+            per_device_eval_batch_size=settings.batch_size,
+            learning_rate=settings.learning_rate,
             remove_unused_columns=False,
-            # The 'device' argument is removed as it is not a valid parameter [1]
         )
 
-        # Initialize Trainer with the model already located on the correct device
         trainer = Trainer(
-            model=model_lora, 
-            args=training_args, 
+            model=model_lora,
+            args=training_args,
             train_dataset=train_ds,
             eval_dataset=eval_ds,
-            compute_metrics=evaluator.compute_all # Use adjusted UnifiedEvaluator
+            compute_metrics=compute_metrics,
         )
 
-        trainer.train()
-        # 4. Bayesian Extension: Laplace-LoRA 
-        if settings.execute_laplace:
-            # We pass the engine to access adapters for curvature estimation
-            laplace_engine = LaplaceLoRAEngine(lora_engine, settings.prior_precision)
-            # 8-core CPU friendly: Accumulate curvature iteratively 
-            laplace_engine.accumulate_curvature(trainer.get_train_dataloader())            
-            # Linearized Prediction for Bayesian Model Averaging 
-            predictor = laplace_engine.get_linearized_predictor()
-            laplace_logits, labels = predictor.predict_batch(val_loader, settings.device)            
-            # Compare with standard metrics 
-            laplace_results = evaluator.compute_all(laplace_logits, labels)
-            logger.info(f"Laplace-LoRA Results: {laplace_results}")
-        # Final cleanup to respect 10GB RAM constraint 
-        MemoryOptimizer.cleanup()
+        if settings.execute_causal_engine:
+            causal_engine = CausalMonteCLoRAEngine(
+                lora_engine=lora_engine,
+                causal_threshold=0.1,
+                sample_budget=1000,
+            )
+            causal_sampler = CausalWeightSampler(
+                causal_engine=causal_engine,
+                model=model_lora,
+                device=settings.device,
+            )
+            causal_config = CausalTrainingConfig(
+                total_causal_budget=1000,
+                async_max_steps=100,
+                apply_interval=10,
+                device=settings.device,
+                enable_warmup=False,
+                warmup_steps=10,
+            )
+
+            orchestrator = CausalTrainingOrchestrator(
+                lora_engine=lora_engine,
+                causal_engine=causal_engine,
+                trainer=trainer,
+                causal_sampler=causal_sampler,
+                config=causal_config,
+            )
+
+            orchestrator.prepare(model_lora, train_loader)
+            orchestrator.run_training()
+            diagnostics = orchestrator.get_diagnostics()
+            logger.info(f"Causal training diagnostics: {diagnostics}")
+        else:
+            trainer.train()
+            logger.info("Causal engine disabled; completed standard LoRA training.")
 
     except Exception as e:
         logger.error(f"Execution failed: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     main()

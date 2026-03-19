@@ -19,6 +19,7 @@ dependencies = [
     "tiktoken>=0.7.0",
     "ipywidgets>=8.1.0",
     "numpy>=2.0.0",           # Explicitly move to 2.0 to align all C-headers
+    "pytest>=9.0.2",
 ]
 
 [[tool.uv.index]]
@@ -30,3 +31,9 @@ explicit = true
 torch = [{ index = "pytorch-cpu" }]
 torchvision = [{ index = "pytorch-cpu" }]
 torchaudio = [{ index = "pytorch-cpu" }]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.6",
+    "psutil>=5.9.0",  # For memory profiling and monitoring (T032)
+]

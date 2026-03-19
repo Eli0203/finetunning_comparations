@@ -51,3 +51,42 @@ class UnifiedEvaluator:
                 avg_confidence_in_bin = confidences[in_bin].mean()
                 ece += torch.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
         return ece.item()
+
+
+def natural_indirect_effect(
+    p_y_given_x_m: torch.Tensor,
+    p_m_x: torch.Tensor,
+    p_m_x_prime: torch.Tensor,
+    m_dim: int = -1,
+) -> torch.Tensor:
+    """Compute the Natural Indirect Effect (NIE) via mediation analysis.
+
+    NIE measures the effect of X on Y that is mediated through M (the mediator).
+
+    Formula (based on Pearl's mediation decomposition):
+        NIE = E[Y_{x, M_{x'}}] - E[Y_{x, M_x}]
+
+    Args:
+        p_y_given_x_m: Tensor representing P(Y | X=x, M=m).
+        p_m_x: Tensor representing P(M=m | X=x).
+        p_m_x_prime: Tensor representing P(M=m | X=x').
+        m_dim: Dimension index corresponding to the mediator M.
+
+    Returns:
+        Tensor containing the NIE for each X/evaluation point.
+    """
+
+    # Ensure the mediator distributions are normalized
+    p_m_x = p_m_x / p_m_x.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+    p_m_x_prime = p_m_x_prime / p_m_x_prime.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+    # Align shapes for broadcasting
+    target_shape = [1] * p_y_given_x_m.ndim
+    target_shape[m_dim] = -1
+    p_m_x_expanded = p_m_x.view(*target_shape)
+    p_m_x_prime_expanded = p_m_x_prime.view(*target_shape)
+
+    e_y_x_mprime = (p_y_given_x_m * p_m_x_prime_expanded).sum(dim=m_dim)
+    e_y_x_m = (p_y_given_x_m * p_m_x_expanded).sum(dim=m_dim)
+
+    return e_y_x_mprime - e_y_x_m
