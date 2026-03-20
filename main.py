@@ -16,13 +16,14 @@ def main():
     logger.info("Initializing Fine-tuning Orchestrator...")
 
     # 1. Setup Data and Evaluation
-    loader = GLUEDataLoader(settings.model_id, settings.task_name)
+    loader = GLUEDataLoader(
+        settings.model_id,
+        settings.task_name,
+        max_length=settings.max_seq_length,
+    )
     evaluator = UnifiedEvaluator(settings.task_name)
 
-    train_ds = loader.dataset["train"].map(loader._tokenize_fn, batched=True)
-    eval_ds = loader.dataset["validation"].map(loader._tokenize_fn, batched=True)
-    train_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "token_type_ids", "label"])
-    eval_ds.set_format(type="torch", columns=["input_ids", "attention_mask", "token_type_ids", "label"])
+    train_ds, eval_ds, _ = loader.get_datasets(train_split="train")
 
     train_loader = loader.get_loader("train", settings.batch_size)
 

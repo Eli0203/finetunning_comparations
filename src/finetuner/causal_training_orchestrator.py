@@ -13,7 +13,7 @@ NO core logic itself. All actual work is delegated to specialized components.
 """
 
 import torch.nn as nn
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from src.utils.logger import logger
 from src.utils.causal_sampler import CausalWeightSampler
@@ -31,15 +31,23 @@ class WeightApplicationCallback(TrainerCallback):
     weights at the configured interval during training.
     """
     
-    def __init__(self, weight_applier: ContinuousWeightApplier):
+    def __init__(
+        self,
+        weight_applier: ContinuousWeightApplier,
+        sampler_health_check: Optional[Callable[[], None]] = None,
+    ):
         """
         Initialize the callback.
         
         Args:
             weight_applier: ContinuousWeightApplier instance for applying weights
+            sampler_health_check: Optional callable that raises if the background
+                sampler has failed in another process.
         """
         self.weight_applier = weight_applier
+        self.sampler_health_check = sampler_health_check
         self.step_count = 0
+        self.last_error: Optional[str] = None
     
     def on_step_end(
         self,
@@ -55,11 +63,14 @@ class WeightApplicationCallback(TrainerCallback):
         any failures without stopping training.
         """
         try:
+            if self.sampler_health_check is not None:
+                self.sampler_health_check()
             global_step = state.global_step
             weights_applied = self.weight_applier.apply_weights(global_step)
             if weights_applied:
                 logger.debug(f"Applied causal weights at step {global_step}")
         except Exception as e:
+            self.last_error = str(e)
             logger.error(
                 f"Error applying weights at step {state.global_step}: {e}. "
                 "Continuing training without weight application."
@@ -203,6 +214,12 @@ class CausalTrainingOrchestrator:
             logger.info(f"[2/7] ✓ Allocated budget across {len(budget_summary)} paths")
             for path, budget in list(budget_summary.items())[:3]:
                 logger.debug(f"      {path}: {budget} samples")
+
+            # Notify the sampler so it can re-read the now-populated budget.
+            # This eliminates the "no budget allocation" warning that fires when
+            # the sampler is constructed before prepare() is called.
+            self.causal_sampler.refresh_path_weights()
+            logger.info("[2/7] ✓ Sampler path weights refreshed from causal budget")
             
             # Step 3: Create double buffer for inter-process communication
             logger.info("[3/7] Creating double buffer for weight communication (O(1) retrieval)...")
@@ -218,6 +235,7 @@ class CausalTrainingOrchestrator:
                 causal_sampler=self.causal_sampler
             )
             self.async_sampler.start()
+            self.async_sampler.raise_if_failed()
             logger.info(f"[4/7] ✓ Background sampler started ({self.config.async_max_steps} max steps)")
             
             # Step 5: Create weight applier
@@ -237,7 +255,10 @@ class CausalTrainingOrchestrator:
             
             # Step 7: Register trainer callback for weight application
             logger.info("[7/7] Registering weight application callback with HuggingFace Trainer...")
-            self.weight_callback = WeightApplicationCallback(self.weight_applier)
+            self.weight_callback = WeightApplicationCallback(
+                self.weight_applier,
+                sampler_health_check=self.async_sampler.raise_if_failed,
+            )
             self.trainer.add_callback(self.weight_callback)
             logger.info("[7/7] ✓ Callback registered")
             
@@ -251,6 +272,11 @@ class CausalTrainingOrchestrator:
             
         except Exception as e:
             self._state = self.FAILED
+            if self.async_sampler is not None:
+                try:
+                    self.async_sampler.stop()
+                except Exception as stop_exc:
+                    logger.error(f"Error stopping sampler after prepare failure: {stop_exc}")
             logger.error(f"Failed to prepare orchestrator: {e}")
             raise
     
@@ -277,6 +303,9 @@ class CausalTrainingOrchestrator:
         try:
             self._state = self.TRAINING
             logger.info("Starting causal training with continuous weight application...")
+
+            if self.async_sampler is not None:
+                self.async_sampler.raise_if_failed()
 
             # Optional warm-up before main training
             if self.config.enable_warmup and self.config.warmup_steps:
@@ -353,6 +382,10 @@ class CausalTrainingOrchestrator:
                 if self.budget_monitor else None,
             'training_metrics': self.trainer.state.best_metric
                 if self.trainer and self.trainer.state else None,
+            'async_sampler_status': self.async_sampler.get_status()
+                if self.async_sampler else None,
+            'callback_error': self.weight_callback.last_error
+                if self.weight_callback else None,
             'config': {
                 'total_causal_budget': self.config.total_causal_budget,
                 'async_max_steps': self.config.async_max_steps,

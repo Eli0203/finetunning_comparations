@@ -3,7 +3,7 @@ Finetuning Engine for LoRA-based Adaptation
 Author: Eliana Vallejo
 """
 
-from typing import Protocol, List
+from typing import Protocol
 from peft import get_peft_model, LoraConfig, TaskType
 from src.utils.logger import logger
 

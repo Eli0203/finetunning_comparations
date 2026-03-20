@@ -6,7 +6,7 @@ Research-oriented fine-tuning workspace for GLUE-style sequence classification w
 - an optional causal LoRA orchestration pipeline wired behind a settings flag
 - legacy or experimental Laplace and QLoRA components that exist as library modules but are not currently used by `main.py`
 
-**Status**: Project implementation complete through Phase 6. Documentation refreshed from the current `src/` tree on March 19, 2026.
+**Status**: Project implementation complete through Phase 7. Documentation refreshed from the current `src/` tree on March 20, 2026.
 
 ---
 
@@ -37,7 +37,7 @@ If `EXECUTE_CAUSAL_ENGINE=true`, the runtime switches from plain LoRA training t
 - `src/utils/logger.py`
 - `src/utils/metrics.py`
 
-### Present in `src/` but not wired into the current entry point
+### Present in `src/` and used transitively by the causal path
 
 - `src/finetuner/laplace_engine.py`
 - `src/finetuner/qlora_engine.py`
@@ -48,7 +48,7 @@ If `EXECUTE_CAUSAL_ENGINE=true`, the runtime switches from plain LoRA training t
 - `src/utils/multiprocessing.py`
 - `src/utils/hf_manager.py`
 
-Those modules are still important because the causal pipeline depends on several of them, and the test suite covers them directly.
+These modules are not imported directly by `main.py`, but they are part of the active causal execution path through `CausalTrainingOrchestrator` and are covered by the test suite.
 
 ---
 
@@ -183,7 +183,7 @@ What changes when causal mode is enabled:
 - `CausalWeightSampler` generates causal-budget-scaled weights
 - `CausalTrainingOrchestrator.prepare()` initializes the async pipeline
 - training proceeds through a callback that periodically applies weights to the live model
-- diagnostics are logged after training
+- diagnostics are logged after training, including async sampler health and callback-visible errors
 
 ---
 
@@ -222,7 +222,7 @@ These notes come directly from reviewing the current `src/` code.
 
 ### Data loader assumptions
 
-`GLUEDataLoader` currently tokenizes `sentence1` and `sentence2`, so it is aligned with paired-sentence tasks such as MRPC. It is not yet a general loader for all GLUE tasks.
+`GLUEDataLoader` now uses a Strategy-based task resolver for `mrpc`, `sst2`, and `qnli`, so schema handling is centralized in `src/finetuner/data_loader.py` and shared by both `main.py` and the notebook workflow.
 
 ### Runtime mode selection
 
@@ -240,9 +240,32 @@ These notes come directly from reviewing the current `src/` code.
 
 `CausalMonteCLoRAEngine._compute_causal_sensitivity()` is currently a simplified gradient-magnitude proxy rather than a full intervention-based causal estimator.
 
+### Device-aware causal execution
+
+The causal path now supports mixed deployment conditions safely:
+
+- training tensors are moved to the model device during causal-path discovery, warm-up, and marginal-likelihood validation
+- if CUDA is available, `settings.device` resolves to `cuda`; otherwise the runtime stays on `mps` or `cpu`
+- sampled weights remain on CPU across the multiprocessing boundary and are moved onto the target training device only at application time
+
+### Multiprocessing safety and error capture
+
+The async sampling path now uses an explicit `spawn` multiprocessing context, a spawn-safe `DoubleBuffer`, and parent-visible sampler health checks.
+
+- worker failures are surfaced to the parent process through `BackgroundSampler.raise_if_failed()`
+- `WeightApplicationCallback` checks sampler health during training and records callback-visible errors
+- `CausalTrainingOrchestrator.get_diagnostics()` now includes `async_sampler_status` and `callback_error`
+
 ### Math utilities
 
-`math_utils.py` contains working primitives but also duplicated Laplace helper methods. The docs treat it as a utility module, but not all functions are equally mature.
+`math_utils.py` contains the core causal and Laplace helper primitives used across the project. After the strict Phase 6 cleanup pass, duplicate helper definitions were removed and the module is lint-clean.
+
+### Validation snapshot
+
+Current validation snapshot on March 20, 2026:
+
+- `uv run ruff check src tests` passed
+- `uv run pytest -q` passed with 129 tests
 
 ---
 
@@ -250,6 +273,7 @@ These notes come directly from reviewing the current `src/` code.
 
 - [DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md): entry point for the repo docs set
 - [SOURCE_CODE_DOCUMENTATION.md](SOURCE_CODE_DOCUMENTATION.md): module-by-module reference for `src/`
+- [MULTIPROCESSING_DUMMIES_GUIDE.md](MULTIPROCESSING_DUMMIES_GUIDE.md): beginner-friendly guide to multiprocessing, traceability issues, and safe fixes in this repo
 - [specs/feature_causal_lora/tasks.md](specs/feature_causal_lora/tasks.md): implementation status and task history
 - [PHASE_6_COMPLETION.md](PHASE_6_COMPLETION.md): final polish-phase summary
 

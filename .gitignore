@@ -17,10 +17,22 @@ build/
 # Results and outputs
 final_model_LoRA/
 output_LoRA/
+output_mrpc/
+output/
 results_LoRA/
+data/
+logs/
 finetuning.log
 *.log
 specs/
+.specify/
+.specific/
+finetunning.ipynb
+*.safetensors
+*.pt
+*.pth
+training_args.bin
+trainer_state.json
 # config files — exclude real .env files (contain secrets)
 # .env.example is INTENTIONALLY tracked (template with placeholders)
 .env
@@ -33,6 +45,8 @@ specs/
 .DS_Store
 Thumbs.db
 *.tmp
+.pytest_cache/
+.ruff_cache/
 
 # Markdown files
 *.md

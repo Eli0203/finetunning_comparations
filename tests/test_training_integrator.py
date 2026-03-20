@@ -12,7 +12,7 @@ Tests verify:
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock
 from src.utils.training_integrator import ContinuousWeightApplier, TrainingBudgetMonitor
 
 

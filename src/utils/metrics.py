@@ -1,9 +1,7 @@
 import torch
 import torch.nn.functional as F
 import evaluate
-import numpy as np
-from typing import Dict, Any
-from src.utils.logger import logger
+from typing import Dict
 
 class UnifiedEvaluator:
     """Standardized evaluation engine for LoRA and Bayesian Laplace-LoRA [3]."""

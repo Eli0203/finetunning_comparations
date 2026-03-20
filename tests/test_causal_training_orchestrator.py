@@ -15,8 +15,7 @@ Test Categories:
 """
 
 import unittest
-from unittest.mock import Mock, MagicMock, patch, call
-import torch
+from unittest.mock import Mock, patch
 import torch.nn as nn
 from transformers import TrainingArguments, TrainerState
 
@@ -285,6 +284,7 @@ class TestOrchestratorPrepare(unittest.TestCase):
         mock_optimizer.create_double_buffer.assert_called_once()
         mock_sampler.assert_called_once()
         mock_sampler_instance.start.assert_called_once()
+        mock_sampler_instance.raise_if_failed.assert_called_once()
         mock_applier.assert_called_once()
         mock_monitor.assert_called_once()
         self.trainer.add_callback.assert_called_once()
@@ -361,6 +361,7 @@ class TestOrchestratorRunTraining(unittest.TestCase):
         """Test run_training() calls trainer.train()."""
         self.orchestrator.run_training()
         
+        self.orchestrator.async_sampler.raise_if_failed.assert_called_once()
         self.trainer.train.assert_called_once()
     
     def test_run_training_stops_sampler(self):
@@ -518,6 +519,28 @@ class TestErrorHandling(unittest.TestCase):
         
         # Should return control unchanged
         self.assertEqual(result, control)
+
+    def test_weight_callback_captures_sampler_health_errors(self):
+        """Test callback logs and stores background sampler failures."""
+        applier = Mock()
+        sampler_health_check = Mock(side_effect=RuntimeError("Worker failed"))
+
+        callback = WeightApplicationCallback(
+            applier,
+            sampler_health_check=sampler_health_check,
+        )
+
+        args = Mock(spec=TrainingArguments)
+        state = Mock(spec=TrainerState)
+        state.global_step = 10
+        control = Mock()
+
+        result = callback.on_step_end(args, state, control)
+
+        self.assertEqual(result, control)
+        sampler_health_check.assert_called_once()
+        applier.apply_weights.assert_not_called()
+        self.assertEqual(callback.last_error, "Worker failed")
 
 
 class TestMemory(unittest.TestCase):

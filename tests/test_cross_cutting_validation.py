@@ -12,13 +12,12 @@ import torch
 import torch.nn as nn
 import threading
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from src.utils.async_sampler import BackgroundSampler
 from src.utils.memory_manager import MemoryOptimizer
 from src.utils.causal_sampler import CausalWeightSampler
 from src.utils.training_integrator import ContinuousWeightApplier
-from src.utils.logger import logger
 
 
 class SimpleModel(nn.Module):
@@ -110,6 +109,27 @@ class TestAsyncSamplerGracefulShutdown(unittest.TestCase):
         # Process should be stopped or joining
         self.assertFalse(async_sampler.process.is_alive())
 
+    def test_sampler_surfaces_worker_error_to_parent(self):
+        """Parent-side health checks must surface worker failures deterministically."""
+        model = SimpleModel()
+        buffer = MemoryOptimizer.create_double_buffer()
+        causal_engine = MockCausalEngine()
+        sampler = CausalWeightSampler(causal_engine, model)
+
+        async_sampler = BackgroundSampler(
+            buffer=buffer,
+            model=model,
+            max_steps=5,
+            causal_sampler=sampler,
+        )
+
+        async_sampler._error_state['last_error'] = 'intentional worker failure'
+
+        with self.assertRaises(RuntimeError) as context:
+            async_sampler.raise_if_failed()
+
+        self.assertIn("intentional worker failure", str(context.exception))
+
 
 class TestDoubleBufferThreadSafety(unittest.TestCase):
     """Test DoubleBuffer is thread-safe."""
@@ -141,7 +161,7 @@ class TestDoubleBufferThreadSafety(unittest.TestCase):
             """Reader thread that gets latest data from buffer."""
             try:
                 for i in range(10):
-                    data = buffer.get_latest()
+                    buffer.get_latest()
                     with lock:
                         results['gets'] += 1
                     time.sleep(0.001)
@@ -180,7 +200,7 @@ class TestDoubleBufferThreadSafety(unittest.TestCase):
         
         # All gets should succeed (not raise exceptions)
         for _ in range(100):
-            result = buffer.get_latest()
+            buffer.get_latest()
             # Result could be None (empty) or dict, both valid
 
 

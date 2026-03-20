@@ -51,38 +51,76 @@ class CausalMonteCLoRAEngine:
     def identify_causal_paths(
         self,
         model: nn.Module,
-        data_loader: torch.utils.data.DataLoader
+        data_loader: torch.utils.data.DataLoader,
     ) -> List[str]:
         """
         Identify modules with significant causal sensitivity using backdoor adjustment.
 
+        Sensitivity is approximated by gradient magnitude: one forward + backward pass
+        is executed on a single mini-batch (device-aware) to populate ``.grad`` on each
+        module's weight, then modules whose gradient L1 mean exceeds
+        ``causal_threshold`` are selected as causal paths.
+
         Args:
-            model: The model to analyze
-            data_loader: Data loader for computing causal effects
+            model: The model to analyse.  Placed on its current device automatically.
+            data_loader: Data loader used for gradient computation.
 
         Returns:
-            List of module names that show causal sensitivity above threshold
+            List of module names that show causal sensitivity above threshold.
         """
         logger.info("Identifying causal paths using backdoor adjustment...")
 
-        causal_paths = []
+        device = self._resolve_device(model)
+        logger.debug(f"Sensitivity analysis device: {device}")
+
+        # --- Populate gradients via a single forward/backward pass ---
+        # train() mode is required so that BN/Dropout behave correctly and
+        # gradients flow through all parameters.
+        model.train()
+        model.zero_grad()
+        gradients_populated = False
+
+        for batch in data_loader:
+            try:
+                filtered = self._filter_model_inputs(batch)
+                if not filtered:
+                    logger.debug("Batch produced no valid model inputs; skipping.")
+                    break
+                filtered = self._move_batch_to_device(filtered, device)
+                outputs = model(**filtered)
+                loss = getattr(outputs, 'loss', None)
+                if loss is not None:
+                    loss.backward()
+                    gradients_populated = True
+                else:
+                    logger.debug("Batch has no loss output; gradients not computed.")
+            except Exception as exc:
+                logger.warning(f"Sensitivity forward pass failed: {exc}. Returning no causal paths.")
+            break  # A single batch is sufficient for gradient-based sensitivity
+
+        if not gradients_populated:
+            logger.warning(
+                "Gradient population skipped (empty loader, no loss, or forward error). "
+                "Returning empty causal paths."
+            )
+
         model.eval()
 
-        # Get all named modules
+        # --- Inspect per-module gradient magnitudes ---
+        causal_paths = []
         for name, module in model.named_modules():
             if not hasattr(module, 'weight') or module.weight is None:
                 continue
-
-            # Compute causal sensitivity for this module
-            sensitivity = self._compute_causal_sensitivity(module, data_loader)
-
+            sensitivity = self._compute_causal_sensitivity(module)
             if sensitivity > self.causal_threshold:
                 causal_paths.append(name)
                 logger.debug(f"Module {name} shows causal sensitivity: {sensitivity:.4f}")
 
+        # Clean up gradients so training loop starts from scratch
+        model.zero_grad()
+
         self.causal_paths = causal_paths
         logger.info(f"Identified {len(causal_paths)} causal paths: {causal_paths}")
-
         return causal_paths
 
     def allocate_budget(self, causal_paths: List[str], total_budget: int) -> Dict[str, int]:
@@ -117,36 +155,26 @@ class CausalMonteCLoRAEngine:
 
         return allocation
 
-    def _compute_causal_sensitivity(
-        self,
-        module: nn.Module,
-        data_loader: torch.utils.data.DataLoader
-    ) -> float:
+    def _compute_causal_sensitivity(self, module: nn.Module) -> float:
         """
-        Compute causal sensitivity for a module using simplified backdoor adjustment.
+        Read the L1 gradient magnitude for *module.weight* after a backward pass.
 
-        This is a placeholder implementation - in practice would use actual causal
-        inference on gradients and activations.
+        ``identify_causal_paths`` is responsible for running the forward/backward
+        pass that populates ``.grad`` before this method is called.  If no
+        gradient is available (e.g. the loader was empty) this returns ``0.0``
+        so the module is safely excluded from the causal paths.
+
+        Args:
+            module: The sub-module to inspect.
+
+        Returns:
+            Mean absolute gradient value, or 0.0 if no gradient is present.
         """
-        # Simplified: use gradient magnitude as proxy for causal sensitivity
-        # In full implementation, this would use CausalMath.backdoor_adjustment
-        # on intervention effects
-
-        sensitivity = 0.0
-        count = 0
-
-        for batch in data_loader:
-            # This is a simplified computation - real implementation would
-            # compute intervention effects and use backdoor adjustment
-            if hasattr(module, 'weight') and module.weight.grad is not None:
-                grad_magnitude = module.weight.grad.abs().mean().item()
-                sensitivity += grad_magnitude
-                count += 1
-
-            if count >= 10:  # Limit to first 10 batches for efficiency
-                break
-
-        return sensitivity / max(count, 1)
+        if not hasattr(module, 'weight') or module.weight is None:
+            return 0.0
+        if module.weight.grad is None:
+            return 0.0
+        return float(module.weight.grad.abs().mean().item())
 
     def get_causal_summary(self) -> Dict[str, Any]:
         """
@@ -193,11 +221,12 @@ class CausalMonteCLoRAEngine:
             return self._warmup_state
 
         model.train()
+        device = self._resolve_device(model)
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
         losses: List[float] = []
         steps = 0
 
-        logger.info(f"Starting warm-up for {num_warmup_steps} steps")
+        logger.info(f"Starting warm-up for {num_warmup_steps} steps (device={device})")
         while steps < num_warmup_steps:
             steps_before_round = steps
             for batch in train_loader:
@@ -206,7 +235,9 @@ class CausalMonteCLoRAEngine:
 
                 try:
                     optimizer.zero_grad(set_to_none=True)
-                    outputs = model(**self._filter_model_inputs(batch))
+                    filtered = self._filter_model_inputs(batch)
+                    filtered = self._move_batch_to_device(filtered, device)
+                    outputs = model(**filtered)
                     loss = getattr(outputs, 'loss', None)
 
                     if loss is None:
@@ -259,11 +290,8 @@ class CausalMonteCLoRAEngine:
             for batch in val_loader:
                 try:
                     filtered_batch = self._filter_model_inputs(batch)
-                    if device != 'cpu':
-                        filtered_batch = {
-                            k: v.to(device) if torch.is_tensor(v) else v
-                            for k, v in filtered_batch.items()
-                        }
+                    # Always move to target device regardless of whether it is CPU or CUDA
+                    filtered_batch = self._move_batch_to_device(filtered_batch, device)
 
                     outputs = model(**filtered_batch)
                     loss = getattr(outputs, 'loss', None)
@@ -297,6 +325,42 @@ class CausalMonteCLoRAEngine:
         self._marginal_likelihood = mml
         logger.info(f"Estimated marginal likelihood: {mml:.6f}")
         return mml
+
+    @staticmethod
+    def _resolve_device(model: nn.Module) -> torch.device:
+        """Return the device of the first model parameter, defaulting to CPU.
+
+        Args:
+            model: Any ``nn.Module``.
+
+        Returns:
+            The ``torch.device`` where the model lives.
+        """
+        try:
+            return next(model.parameters()).device
+        except StopIteration:
+            return torch.device('cpu')
+
+    @staticmethod
+    def _move_batch_to_device(
+        batch: Dict[str, Any],
+        device: torch.device,
+    ) -> Dict[str, Any]:
+        """Move all tensor values in *batch* to *device*.
+
+        Non-tensor values (e.g. strings, ints) are left unchanged.
+
+        Args:
+            batch: A dict of keyword arguments for a model's forward method.
+            device: Target ``torch.device``.
+
+        Returns:
+            A new dict with tensor values moved to *device*.
+        """
+        return {
+            k: v.to(device) if torch.is_tensor(v) else v
+            for k, v in batch.items()
+        }
 
     @staticmethod
     def _filter_model_inputs(batch: Any) -> Dict[str, Any]:

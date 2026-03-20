@@ -3,8 +3,6 @@ from typing import Any, Dict, Iterable, Tuple
 import torch
 from src.utils.math_utils import LaplaceMath
 from src.utils.logger import logger
-# CORRECTED: Now used for Dependency Injection and metadata access
-from src.finetuner.lora_engine import FineTuningEngine
 
 class LaplaceLoRAEngine:
     def __init__(self, lora_engine, prior_precision: float = 1.0, nkfac: int = 10):

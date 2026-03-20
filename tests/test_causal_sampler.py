@@ -10,7 +10,7 @@ Tests verify:
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 from src.utils.causal_sampler import CausalWeightSampler
 
 
@@ -47,11 +47,13 @@ class TestCausalWeightSamplerInitialization:
         engine = MockCausalEngine(
             budget_allocation={'layer.1.attn': 100, 'layer.2.mlp': 50}
         )
-        
+
         sampler = CausalWeightSampler(engine, model, device='cpu')
-        
+
         assert sampler.causal_engine == engine
-        assert sampler.model == model
+        # _param_specs must contain metadata for all model parameters
+        assert sampler._param_specs is not None
+        assert len(sampler._param_specs) == len(list(model.named_parameters()))
         assert sampler.device == 'cpu'
         assert len(sampler.path_weights) == 2
     
@@ -69,10 +71,73 @@ class TestCausalWeightSamplerInitialization:
         """Test initialization when causal engine has no budget_allocation."""
         model = SimpleLoRAModel()
         engine = Mock(spec=['sample_budget'])  # Only has sample_budget, not budget_allocation
-        
+
         sampler = CausalWeightSampler(engine, model)
-        
+
         assert 'default' in sampler.path_weights
+
+    def test_param_specs_captured_at_init(self):
+        """_param_specs must mirror every named parameter of the model."""
+        model = SimpleLoRAModel()
+        engine = MockCausalEngine(budget_allocation={'lora': 100})
+
+        sampler = CausalWeightSampler(engine, model)
+
+        param_names = {name for name, _ in model.named_parameters()}
+        assert set(sampler._param_specs.keys()) == param_names
+
+    def test_lora_param_specs_filtered(self):
+        """_lora_param_specs must contain only LoRA parameters."""
+        model = SimpleLoRAModel(use_lora=True)
+        engine = MockCausalEngine(budget_allocation={'lora': 100})
+
+        sampler = CausalWeightSampler(engine, model)
+
+        for name in sampler._lora_param_specs:
+            assert 'lora' in name.lower(), f"Non-lora param in _lora_param_specs: {name}"
+
+    def test_refresh_path_weights_updates_from_engine(self):
+        """refresh_path_weights must re-read budget_allocation from the engine."""
+        model = SimpleLoRAModel()
+        engine = MockCausalEngine(budget_allocation={})  # empty at init
+
+        sampler = CausalWeightSampler(engine, model)
+        # Initially uniform (empty budget)
+        assert 'default' in sampler.path_weights
+
+        # Simulate allocate_budget being called on the engine
+        engine.budget_allocation = {'lora_A': 100, 'lora_B': 50}
+        sampler.refresh_path_weights()
+
+        assert 'default' not in sampler.path_weights
+        assert len(sampler.path_weights) == 2
+        assert abs(sampler.path_weights['lora_A'] - 2 / 3) < 1e-5
+
+    def test_refresh_path_weights_no_engine(self):
+        """refresh_path_weights must be a no-op when causal_engine is None."""
+        model = SimpleLoRAModel()
+        engine = MockCausalEngine(budget_allocation={'lora': 100})
+
+        sampler = CausalWeightSampler(engine, model)
+        sampler.causal_engine = None  # Simulate worker-side state after unpickling
+
+        # Must not raise
+        sampler.refresh_path_weights()
+        assert sampler.path_weights  # unchanged
+
+    def test_pickle_excludes_causal_engine(self):
+        """Pickled sampler must not contain a reference to causal_engine."""
+        import pickle
+        model = SimpleLoRAModel()
+        engine = MockCausalEngine(budget_allocation={'lora': 100})
+
+        sampler = CausalWeightSampler(engine, model)
+        restored = pickle.loads(pickle.dumps(sampler))
+
+        assert restored.causal_engine is None
+        # path_weights and _param_specs must survive pickling
+        assert restored.path_weights == sampler.path_weights
+        assert set(restored._param_specs.keys()) == set(sampler._param_specs.keys())
 
 
 class TestPathWeightComputation:
@@ -271,15 +336,16 @@ class TestBatchSampling:
         assert len(weights) > 0
     
     def test_sample_batch_device_placement(self):
-        """Test that sampled tensors are on correct device."""
+        """Sampled tensors must always be on CPU (consumers move to target device)."""
         model = SimpleLoRAModel()
         engine = MockCausalEngine(
             budget_allocation={'lora': 1.0}
         )
-        
+
+        # device kwarg is stored for external callers but sampling is always CPU
         sampler = CausalWeightSampler(engine, model, device='cpu')
         weights = sampler.sample_batch()
-        
+
         for tensor in weights.values():
             assert tensor.device.type == 'cpu'
 

@@ -4,22 +4,26 @@ This module contains helper primitives for inter-process communication
 used throughout the finetuning pipeline.
 """
 
-import torch
+import torch.multiprocessing as mp
 
 
 class DoubleBuffer:
     """A lightweight double-buffer for inter-process weight sharing.
 
     This buffer provides O(1) read access to the latest produced item.
-    It is implemented using `torch.multiprocessing.Manager` proxies so it works
-    across process boundaries.
+    All IPC primitives are created with an explicit **spawn** context to prevent
+    the ``SemLock`` fork/spawn mismatch that occurs when the system default
+    context is ``fork`` (Linux) but worker processes are started with ``spawn``.
     """
 
     def __init__(self):
-        manager = torch.multiprocessing.Manager()
+        # Explicitly use spawn context so that Manager and Lock are spawn-safe
+        # regardless of the process-global start method default.
+        ctx = mp.get_context("spawn")
+        manager = ctx.Manager()
         self._slots = manager.list([None, None])
         self._current = manager.Value("i", 0)
-        self._lock = torch.multiprocessing.Lock()
+        self._lock = ctx.Lock()
 
     def put(self, item):
         """Store an item in the next slot and update the latest pointer."""
