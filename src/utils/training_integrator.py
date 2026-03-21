@@ -58,6 +58,11 @@ class ContinuousWeightApplier:
         self._times_applied = 0
         self._weight_deltas: list[float] = []
         self._last_applied_step: Optional[int] = None
+        self._last_applied_param_count = 0
+        self._empty_buffer_skips = 0
+        self._invalid_payload_skips = 0
+        self._validation_rejections = 0
+        self._nan_replacements = 0
         
         logger.info(
             f"ContinuousWeightApplier initialized with interval={apply_interval}, "
@@ -85,19 +90,41 @@ class ContinuousWeightApplier:
             # Handle empty buffer
             if weights_dict is None:
                 logger.debug(f"Step {global_step}: Buffer empty, skipping weight application")
+                self._empty_buffer_skips += 1
+                return False
+
+            if not isinstance(weights_dict, dict):
+                logger.error(
+                    f"Step {global_step}: Invalid buffer payload type {type(weights_dict)}; "
+                    "expected dict[str, Tensor]."
+                )
+                self._invalid_payload_skips += 1
+                return False
+
+            validated_weights = self._validate_weights_for_application(weights_dict, global_step)
+            if not validated_weights:
+                logger.debug(f"Step {global_step}: No valid weights after validation")
+                self._validation_rejections += 1
                 return False
             
             # Apply weights to model
-            self._apply_weights_to_model(weights_dict)
+            self._apply_weights_to_model(validated_weights)
             
             # Track metrics
             self._times_applied += 1
             self._last_applied_step = global_step
+            self._last_applied_param_count = len(validated_weights)
             
             # Log weight application with delta statistics
             if self._weight_deltas:
-                avg_delta = sum(self._weight_deltas[-len(weights_dict):]) / len(weights_dict) if weights_dict else 0.0
-                logger.info(f"Step {global_step}: Applied weights ({len(weights_dict)} params) | avg delta: {avg_delta:.6f}")
+                avg_delta = (
+                    sum(self._weight_deltas[-len(validated_weights):]) / len(validated_weights)
+                    if validated_weights else 0.0
+                )
+                logger.info(
+                    f"Step {global_step}: Applied weights ({len(validated_weights)} params) | "
+                    f"avg delta: {avg_delta:.6f}"
+                )
             else:
                 logger.debug(f"Step {global_step}: Applied weights to model")
             
@@ -106,6 +133,37 @@ class ContinuousWeightApplier:
         except Exception as e:
             logger.error(f"Error applying weights at step {global_step}: {e}")
             return False
+
+    def _validate_weights_for_application(
+        self,
+        weights_dict: Dict[str, Any],
+        global_step: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Return a sanitized tensor payload ready for model application."""
+        validated: Dict[str, torch.Tensor] = {}
+        target_device = self.device.split(':')[0]
+
+        for name, tensor in weights_dict.items():
+            if not isinstance(tensor, torch.Tensor):
+                logger.warning(
+                    f"Step {global_step}: {name} is not a Tensor (is {type(tensor)}), skipping"
+                )
+                self._validation_rejections += 1
+                continue
+
+            if tensor.device.type != target_device:
+                tensor = tensor.to(self.device)
+
+            if not torch.isfinite(tensor).all():
+                logger.warning(
+                    f"Step {global_step}: {name} contains NaN/Inf, replacing with zeros"
+                )
+                tensor = torch.zeros_like(tensor)
+                self._nan_replacements += 1
+
+            validated[name] = tensor
+
+        return validated
     
     def should_apply(self, step: int) -> bool:
         """
@@ -163,19 +221,23 @@ class ContinuousWeightApplier:
             - mean_weight_delta: Average magnitude of weight changes
             - total_weight_delta: Sum of all weight change magnitudes
         """
-        if not self._weight_deltas:
-            return {
-                'times_applied': self._times_applied,
-                'last_applied_step': self._last_applied_step,
-                'mean_weight_delta': 0.0,
-                'total_weight_delta': 0.0,
-            }
-        
+        mean_delta = (
+            sum(self._weight_deltas) / len(self._weight_deltas)
+            if self._weight_deltas
+            else 0.0
+        )
+        total_delta = sum(self._weight_deltas) if self._weight_deltas else 0.0
+
         return {
             'times_applied': self._times_applied,
             'last_applied_step': self._last_applied_step,
-            'mean_weight_delta': sum(self._weight_deltas) / len(self._weight_deltas),
-            'total_weight_delta': sum(self._weight_deltas),
+            'mean_weight_delta': mean_delta,
+            'total_weight_delta': total_delta,
+            'last_applied_param_count': self._last_applied_param_count,
+            'empty_buffer_skips': self._empty_buffer_skips,
+            'invalid_payload_skips': self._invalid_payload_skips,
+            'validation_rejections': self._validation_rejections,
+            'nan_replacements': self._nan_replacements,
         }
     
     def reset_metrics(self) -> None:
@@ -183,6 +245,11 @@ class ContinuousWeightApplier:
         self._times_applied = 0
         self._weight_deltas = []
         self._last_applied_step = None
+        self._last_applied_param_count = 0
+        self._empty_buffer_skips = 0
+        self._invalid_payload_skips = 0
+        self._validation_rejections = 0
+        self._nan_replacements = 0
         logger.debug("ContinuousWeightApplier metrics reset")
 
 
@@ -237,25 +304,34 @@ class TrainingBudgetMonitor:
             }
         """
         self._step_count += 1
+        result = self._build_budget_snapshot()
+        logger.debug(f"Step {self._step_count}: Budget utilization: {result}")
+        return result
+
+    def get_current_budget_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Return budget snapshot without incrementing monitor step counter."""
+        return self._build_budget_snapshot()
+
+    def _build_budget_snapshot(self) -> Dict[str, Dict[str, int]]:
+        """Create a point-in-time allocation/consumption view."""
         result: Dict[str, Dict[str, int]] = {}
-        
+
         if not hasattr(self.causal_engine, 'budget_allocation'):
             logger.warning("Causal engine has no budget_allocation")
             return result
-        
+
         allocation = self.causal_engine.budget_allocation
-        
+
         for path, allocated in allocation.items():
             consumed = self._consumption_tracker.get(path, 0)
             remaining = max(0, allocated - consumed)
-            
+
             result[path] = {
                 'allocated': allocated,
                 'consumed': consumed,
                 'remaining': remaining,
             }
-        
-        logger.debug(f"Step {self._step_count}: Budget utilization: {result}")
+
         return result
     
     def get_budget_utilization(self) -> Dict[str, float]:
@@ -290,6 +366,13 @@ class TrainingBudgetMonitor:
             utilization[path] = ratio
         
         return utilization
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return monitoring counters for diagnostics dashboards and logs."""
+        return {
+            'step_count': self._step_count,
+            'tracked_paths': len(self._consumption_tracker),
+        }
     
     def log_weight_application(self, path: str, count: int = 1) -> None:
         """

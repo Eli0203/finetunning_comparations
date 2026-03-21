@@ -437,7 +437,16 @@ class TestOrchestratorDiagnostics(unittest.TestCase):
         self.orchestrator.causal_engine.get_causal_summary.return_value = {}
         mock_monitor = Mock()
         mock_monitor.get_budget_utilization.return_value = {}
+        mock_monitor.get_current_budget_snapshot.return_value = {}
+        mock_monitor.get_metrics.return_value = {'step_count': 0, 'tracked_paths': 0}
         self.orchestrator.budget_monitor = mock_monitor
+        self.orchestrator.weight_applier = Mock()
+        self.orchestrator.weight_applier.get_metrics.return_value = {'times_applied': 3}
+        self.orchestrator.weight_callback = Mock()
+        self.orchestrator.weight_callback.get_metrics.return_value = {'applied_steps': 3}
+        self.orchestrator.weight_callback.last_error = None
+        self.orchestrator.async_sampler = Mock()
+        self.orchestrator.async_sampler.get_status.return_value = {'is_running': False, 'metrics': {}}
         self.trainer.state = Mock(best_metric=0.9)
         
         diagnostics = self.orchestrator.get_diagnostics()
@@ -447,6 +456,11 @@ class TestOrchestratorDiagnostics(unittest.TestCase):
         self.assertIn('causal_summary', diagnostics)
         self.assertIn('budget_utilization', diagnostics)
         self.assertIn('training_metrics', diagnostics)
+        self.assertIn('budget_snapshot', diagnostics)
+        self.assertIn('budget_monitor_metrics', diagnostics)
+        self.assertIn('weight_application_metrics', diagnostics)
+        self.assertIn('callback_metrics', diagnostics)
+        self.assertIn('failure_policy', diagnostics)
         self.assertIn('config', diagnostics)
     
     def test_diagnostics_config_values(self):
@@ -461,6 +475,17 @@ class TestOrchestratorDiagnostics(unittest.TestCase):
         self.assertEqual(config_dict['apply_interval'], 10)
         self.assertEqual(config_dict['device'], 'cpu')
         self.assertEqual(config_dict['seed'], 42)
+
+    def test_diagnostics_failure_policy_values(self):
+        """Diagnostics should expose explicit fail-open/fail-closed policy."""
+        self.orchestrator._state = self.orchestrator.COMPLETED
+
+        diagnostics = self.orchestrator.get_diagnostics()
+        policy = diagnostics['failure_policy']
+
+        self.assertEqual(policy['causal_gradient_unavailable'], 'fail_closed')
+        self.assertEqual(policy['laplace_phase_failure_notebook'], 'fail_closed')
+        self.assertEqual(policy['generic_orchestrator_exception_notebook'], 'fallback_to_standard_lora')
 
 
 class TestErrorHandling(unittest.TestCase):
@@ -541,6 +566,26 @@ class TestErrorHandling(unittest.TestCase):
         sampler_health_check.assert_called_once()
         applier.apply_weights.assert_not_called()
         self.assertEqual(callback.last_error, "Worker failed")
+
+    def test_weight_callback_tracks_applied_and_skipped_steps(self):
+        """Callback metrics should reflect successful and skipped apply cycles."""
+        applier = Mock()
+        applier.apply_weights.side_effect = [True, False]
+
+        callback = WeightApplicationCallback(applier)
+        args = Mock(spec=TrainingArguments)
+        control = Mock()
+
+        state = Mock(spec=TrainerState)
+        state.global_step = 1
+        callback.on_step_end(args, state, control)
+
+        state.global_step = 2
+        callback.on_step_end(args, state, control)
+
+        metrics = callback.get_metrics()
+        self.assertEqual(metrics['applied_steps'], 1)
+        self.assertEqual(metrics['skipped_steps'], 1)
 
 
 class TestMemory(unittest.TestCase):

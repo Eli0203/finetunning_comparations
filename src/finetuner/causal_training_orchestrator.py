@@ -48,6 +48,10 @@ class WeightApplicationCallback(TrainerCallback):
         self.sampler_health_check = sampler_health_check
         self.step_count = 0
         self.last_error: Optional[str] = None
+        self.applied_steps = 0
+        self.skipped_steps = 0
+        self.health_check_failures = 0
+        self.application_failures = 0
     
     def on_step_end(
         self,
@@ -68,15 +72,30 @@ class WeightApplicationCallback(TrainerCallback):
             global_step = state.global_step
             weights_applied = self.weight_applier.apply_weights(global_step)
             if weights_applied:
+                self.applied_steps += 1
                 logger.debug(f"Applied causal weights at step {global_step}")
+            else:
+                self.skipped_steps += 1
         except Exception as e:
             self.last_error = str(e)
+            self.health_check_failures += 1
+            self.application_failures += 1
             logger.error(
                 f"Error applying weights at step {state.global_step}: {e}. "
                 "Continuing training without weight application."
             )
         
         return control
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return callback-level application and failure counters."""
+        return {
+            'applied_steps': self.applied_steps,
+            'skipped_steps': self.skipped_steps,
+            'health_check_failures': self.health_check_failures,
+            'application_failures': self.application_failures,
+            'last_error': self.last_error,
+        }
 
 
 class CausalTrainingOrchestrator:
@@ -336,6 +355,11 @@ class CausalTrainingOrchestrator:
                 )
             
             self._state = self.COMPLETED
+            if self.weight_applier is not None:
+                logger.info(
+                    "Weight application summary: %s",
+                    self.weight_applier.get_metrics(),
+                )
             logger.info("Causal training completed successfully")
             return training_output
             
@@ -380,12 +404,25 @@ class CausalTrainingOrchestrator:
                 if self.causal_engine else None,
             'budget_utilization': self.budget_monitor.get_budget_utilization()
                 if self.budget_monitor else None,
+            'budget_snapshot': self.budget_monitor.get_current_budget_snapshot()
+                if self.budget_monitor else None,
+            'budget_monitor_metrics': self.budget_monitor.get_metrics()
+                if self.budget_monitor else None,
+            'weight_application_metrics': self.weight_applier.get_metrics()
+                if self.weight_applier else None,
+            'callback_metrics': self.weight_callback.get_metrics()
+                if self.weight_callback else None,
             'training_metrics': self.trainer.state.best_metric
                 if self.trainer and self.trainer.state else None,
             'async_sampler_status': self.async_sampler.get_status()
                 if self.async_sampler else None,
             'callback_error': self.weight_callback.last_error
                 if self.weight_callback else None,
+            'failure_policy': {
+                'causal_gradient_unavailable': 'fail_closed',
+                'laplace_phase_failure_notebook': 'fail_closed',
+                'generic_orchestrator_exception_notebook': 'fallback_to_standard_lora',
+            },
             'config': {
                 'total_causal_budget': self.config.total_causal_budget,
                 'async_max_steps': self.config.async_max_steps,

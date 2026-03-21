@@ -12,6 +12,7 @@ import torch
 import torch.multiprocessing as mp
 from typing import Any, Dict, Iterator, Optional, Tuple
 from src.utils.logger import logger
+from src.utils.multiprocessing import get_spawn_context
 
 
 def _random_weight_generator(
@@ -72,9 +73,16 @@ class BackgroundSampler:
             name: (param.shape, param.dtype)
             for name, param in model.named_parameters()
         }
-        self._context = mp.get_context("spawn")
+        self._context = get_spawn_context()
         self._shared_state_manager = self._context.Manager()
         self._error_state = self._shared_state_manager.dict(last_error=None)
+        self._runtime_metrics = self._shared_state_manager.dict(
+            generated_batches=0,
+            published_batches=0,
+            invalid_payload_batches=0,
+            dropped_tensors=0,
+            last_step=-1,
+        )
         self._stop_event = self._context.Event()
         self.max_steps = max_steps
         self.causal_sampler = causal_sampler  # Dependency injection
@@ -102,9 +110,40 @@ class BackgroundSampler:
     def __setstate__(self, state: Dict[str, Any]) -> None:
         """Restore worker state after spawn deserialization."""
         self.__dict__.update(state)
-        self._context = mp.get_context("spawn")
+        self._context = get_spawn_context()
         self._shared_state_manager = None
         self.process = None
+
+    def _ensure_cpu_tensor_payload(
+        self,
+        weights: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        """Return a sanitized weight payload safe for Manager-based IPC.
+
+        Manager proxies serialize payloads. CUDA tensors cannot be serialized
+        across processes in this pipeline, so this method guarantees CPU tensors.
+        """
+        sanitized: Dict[str, torch.Tensor] = {}
+        for name, tensor in weights.items():
+            if not isinstance(tensor, torch.Tensor):
+                logger.error(f"[Worker] Skipping non-tensor payload for {name}: {type(tensor)}")
+                self._increment_metric('dropped_tensors')
+                continue
+
+            if tensor.device.type != "cpu":
+                logger.error(
+                    f"[Worker] Tensor {name} on {tensor.device} (expected CPU). "
+                    "Moving to CPU for safe IPC serialization."
+                )
+                tensor = tensor.cpu()
+
+            sanitized[name] = tensor
+        return sanitized
+
+    def _increment_metric(self, key: str, amount: int = 1) -> None:
+        """Increment a shared worker metric in a manager-safe way."""
+        current = int(self._runtime_metrics.get(key, 0))
+        self._runtime_metrics[key] = current + amount
 
     def _worker(self, max_steps: int) -> None:
         """Worker process that samples and buffers weights.
@@ -130,10 +169,22 @@ class BackgroundSampler:
             if self._stop_event.is_set():
                 return
             try:
-                weights = self.causal_sampler.sample_batch()
+                self._increment_metric('generated_batches')
+                raw_weights = self.causal_sampler.sample_batch()
+                weights = self._ensure_cpu_tensor_payload(raw_weights)
+                if not weights:
+                    logger.warning(f"[Worker] Step {step}: No valid CPU tensor weights sampled")
+                    self._increment_metric('invalid_payload_batches')
+                    self._runtime_metrics['last_step'] = step
+                    continue
                 self.buffer.put(weights)
+                self._increment_metric('published_batches')
+                self._runtime_metrics['last_step'] = step
                 if step % 10 == 0:
-                    logger.debug(f"Causal sampling: step {step}/{max_steps}")
+                    logger.debug(
+                        f"Causal sampling: step {step}/{max_steps} | "
+                        f"tensors_generated={len(weights)}"
+                    )
             except Exception as e:
                 raise RuntimeError(
                     f"Error in causal sampling worker at step {step}: {e}"
@@ -141,10 +192,13 @@ class BackgroundSampler:
     
     def _random_sampling_worker(self, max_steps: int) -> None:
         """Worker using random sampling (legacy). Always generates CPU tensors."""
-        for weights in _random_weight_generator(self._param_specs, max_steps=max_steps):
+        for step, weights in enumerate(_random_weight_generator(self._param_specs, max_steps=max_steps)):
             if self._stop_event.is_set():
                 return
+            self._increment_metric('generated_batches')
             self.buffer.put(weights)
+            self._increment_metric('published_batches')
+            self._runtime_metrics['last_step'] = step
 
     def _refresh_last_error(self) -> None:
         """Refresh cached worker error from shared multiprocessing state."""
@@ -165,6 +219,13 @@ class BackgroundSampler:
             'exitcode': self.process.exitcode if self.process is not None else None,
             'last_error': self._last_error,
             'stop_requested': self._stop_requested,
+            'metrics': {
+                'generated_batches': int(self._runtime_metrics.get('generated_batches', 0)),
+                'published_batches': int(self._runtime_metrics.get('published_batches', 0)),
+                'invalid_payload_batches': int(self._runtime_metrics.get('invalid_payload_batches', 0)),
+                'dropped_tensors': int(self._runtime_metrics.get('dropped_tensors', 0)),
+                'last_step': int(self._runtime_metrics.get('last_step', -1)),
+            },
         }
 
     def raise_if_failed(self) -> None:
@@ -188,6 +249,13 @@ class BackgroundSampler:
         """Start the background sampling process."""
         self._stop_requested = False
         self._stop_event.clear()
+        self._runtime_metrics.update(
+            generated_batches=0,
+            published_batches=0,
+            invalid_payload_batches=0,
+            dropped_tensors=0,
+            last_step=-1,
+        )
         self.process = self._context.Process(target=self._worker, args=(self.max_steps,))
         self.process.daemon = True
         self.process.start()

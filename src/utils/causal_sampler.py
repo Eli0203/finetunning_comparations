@@ -180,13 +180,19 @@ class CausalWeightSampler:
             std = torch.sqrt(torch.tensor(path_weight, dtype=torch.float32))
             # Always CPU — no CUDA tensor crosses the process boundary
             sampled = std * torch.randn(shape, dtype=dtype)
+            if sampled.device.type != 'cpu':
+                logger.warning(f"Tensor {name} sampled on {sampled.device}; moving to CPU")
+                sampled = sampled.cpu()
             state_dict[name] = sampled
             magnitude_stats[name] = sampled.abs().mean().item()
 
         if not state_dict:
             logger.warning("No LoRA parameters found. Sampling all parameters.")
             for name, (shape, dtype) in self._param_specs.items():
-                state_dict[name] = torch.randn(shape, dtype=dtype)
+                sampled = torch.randn(shape, dtype=dtype)
+                if sampled.device.type != 'cpu':
+                    sampled = sampled.cpu()
+                state_dict[name] = sampled
                 magnitude_stats[name] = state_dict[name].abs().mean().item()
         
         # Log per-parameter weight magnitudes for observability

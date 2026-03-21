@@ -1,5 +1,6 @@
 import torch
 from src.finetuner.causal_engine import CausalMonteCLoRAEngine
+from src.finetuner.causal_engine import CausalGradientUnavailableError
 from src.finetuner.lora_engine import FineTuningEngine
 from peft import TaskType
 
@@ -28,7 +29,7 @@ def test_causal_engine_injection():
 
 
 def test_identify_causal_paths_empty():
-    """Test causal path identification with no modules."""
+    """Gradient-unavailable loaders must raise instead of silently falling back."""
     mock_model = torch.nn.Linear(10, 2)
     lora_engine = FineTuningEngine(
         task_type=TaskType.SEQ_CLS,
@@ -45,8 +46,11 @@ def test_identify_causal_paths_empty():
         def __iter__(self):
             return iter([])
 
-    paths = causal_engine.identify_causal_paths(mock_model, MockDataLoader())
-    assert isinstance(paths, list)
+    try:
+        causal_engine.identify_causal_paths(mock_model, MockDataLoader())
+        assert False, "Expected CausalGradientUnavailableError"
+    except CausalGradientUnavailableError:
+        pass
 
 
 def test_allocate_budget_equal():

@@ -11,6 +11,10 @@ from src.utils.math_utils import LaplaceMath
 from src.utils.logger import logger
 
 
+class CausalGradientUnavailableError(RuntimeError):
+    """Raised when causal path detection cannot populate gradients."""
+
+
 class CausalMonteCLoRAEngine:
     """
     Causal orchestration engine that integrates causal inference with LoRA fine-tuning.
@@ -45,6 +49,7 @@ class CausalMonteCLoRAEngine:
             'loss_trajectory': [],
         }
         self._marginal_likelihood: Optional[float] = None
+        self._last_identification_error: Optional[str] = None
 
         logger.info(f"CausalMonteCLoRAEngine initialized with threshold={causal_threshold}, budget={sample_budget}")
 
@@ -68,59 +73,107 @@ class CausalMonteCLoRAEngine:
         Returns:
             List of module names that show causal sensitivity above threshold.
         """
-        logger.info("Identifying causal paths using backdoor adjustment...")
+        logger.info("=" * 70)
+        logger.info("PHASE: Identifying causal paths using backdoor adjustment...")
+        logger.info("=" * 70)
 
         device = self._resolve_device(model)
+        self._last_identification_error = None
         logger.debug(f"Sensitivity analysis device: {device}")
+        logger.debug(f"Causal threshold: {self.causal_threshold}")
 
         # --- Populate gradients via a single forward/backward pass ---
         # train() mode is required so that BN/Dropout behave correctly and
         # gradients flow through all parameters.
         model.train()
         model.zero_grad()
-        gradients_populated = False
 
-        for batch in data_loader:
-            try:
-                filtered = self._filter_model_inputs(batch)
-                if not filtered:
-                    logger.debug("Batch produced no valid model inputs; skipping.")
-                    break
-                filtered = self._move_batch_to_device(filtered, device)
-                outputs = model(**filtered)
-                loss = getattr(outputs, 'loss', None)
-                if loss is not None:
-                    loss.backward()
-                    gradients_populated = True
-                else:
-                    logger.debug("Batch has no loss output; gradients not computed.")
-            except Exception as exc:
-                logger.warning(f"Sensitivity forward pass failed: {exc}. Returning no causal paths.")
-            break  # A single batch is sufficient for gradient-based sensitivity
-
-        if not gradients_populated:
-            logger.warning(
-                "Gradient population skipped (empty loader, no loss, or forward error). "
-                "Returning empty causal paths."
+        try:
+            batch = next(iter(data_loader))
+        except StopIteration as exc:
+            message = (
+                "Gradient population failed: training loader is empty or exhausted. "
+                "Baseline LoRA fallback is disabled for causal execution."
             )
+            self._last_identification_error = message
+            logger.error(message)
+            raise CausalGradientUnavailableError(message) from exc
+        except Exception as exc:
+            message = (
+                f"Gradient population failed while reading from the training loader: {exc}. "
+                "Baseline LoRA fallback is disabled for causal execution."
+            )
+            self._last_identification_error = message
+            logger.error(message)
+            raise CausalGradientUnavailableError(message) from exc
+
+        if isinstance(batch, dict):
+            logger.debug(f"Batch keys: {list(batch.keys())}")
+
+        try:
+            filtered = self._filter_model_inputs(batch)
+            if not filtered:
+                raise CausalGradientUnavailableError(
+                    "Gradient population failed: batch produced no valid model inputs. "
+                    "Baseline LoRA fallback is disabled for causal execution."
+                )
+
+            filtered = self._move_batch_to_device(filtered, device)
+            outputs = model(**filtered)
+            loss = getattr(outputs, 'loss', None)
+            if loss is None:
+                raise CausalGradientUnavailableError(
+                    "Gradient population failed: model outputs do not expose a loss tensor. "
+                    "Baseline LoRA fallback is disabled for causal execution."
+                )
+
+            loss.backward()
+            logger.debug(f"Gradient population succeeded with loss={float(loss.detach().item()):.6f}")
+        except CausalGradientUnavailableError as exc:
+            self._last_identification_error = str(exc)
+            model.zero_grad()
+            logger.error(self._last_identification_error)
+            raise
+        except Exception as exc:
+            message = (
+                f"Gradient population failed during the causal sensitivity pass: {exc}. "
+                "Baseline LoRA fallback is disabled for causal execution."
+            )
+            self._last_identification_error = message
+            model.zero_grad()
+            logger.error(message)
+            raise CausalGradientUnavailableError(message) from exc
 
         model.eval()
 
         # --- Inspect per-module gradient magnitudes ---
         causal_paths = []
+        module_sensitivities = []
         for name, module in model.named_modules():
             if not hasattr(module, 'weight') or module.weight is None:
                 continue
             sensitivity = self._compute_causal_sensitivity(module)
+            module_sensitivities.append((name, sensitivity))
             if sensitivity > self.causal_threshold:
                 causal_paths.append(name)
                 logger.debug(f"Module {name} shows causal sensitivity: {sensitivity:.4f}")
+
+        if module_sensitivities:
+            logger.debug("Top 10 most sensitive modules:")
+            for name, sensitivity in sorted(module_sensitivities, key=lambda item: item[1], reverse=True)[:10]:
+                logger.debug(f"  {name}: {sensitivity:.4f}")
 
         # Clean up gradients so training loop starts from scratch
         model.zero_grad()
 
         self.causal_paths = causal_paths
-        logger.info(f"Identified {len(causal_paths)} causal paths: {causal_paths}")
+        if causal_paths:
+            logger.info(f"Identified {len(causal_paths)} causal paths: {causal_paths}")
+        else:
+            logger.warning(
+                "No causal paths identified above threshold after successful gradient population. "
+                "Causal execution can continue only if the caller explicitly accepts empty allocation."
+            )
         return causal_paths
 
     def allocate_budget(self, causal_paths: List[str], total_budget: int) -> Dict[str, int]:
@@ -190,6 +243,7 @@ class CausalMonteCLoRAEngine:
             'causal_threshold': self.causal_threshold,
             'warmup_state': self.get_warmup_state(),
             'marginal_likelihood': self._marginal_likelihood,
+            'last_identification_error': self._last_identification_error,
         }
 
     def warmup(

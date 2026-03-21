@@ -1,3 +1,9 @@
+from src.utils.multiprocessing import configure_spawn_context
+
+# Configure multiprocessing as early as possible to avoid fork/spawn mismatches
+# in notebook runtimes (e.g., Colab Linux kernels).
+_mp_setup = configure_spawn_context()
+
 import torch
 from peft import TaskType
 from src.settings.settings import settings
@@ -10,6 +16,14 @@ from src.finetuner.causal_engine import CausalMonteCLoRAEngine
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
 from src.settings.settings import CausalTrainingConfig
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
+
+logger.info(_mp_setup.message)
+logger.info(
+    "Multiprocessing runtime | requested=%s current=%s env=%s",
+    _mp_setup.requested_method,
+    _mp_setup.current_method,
+    "colab" if _mp_setup.is_colab else "local",
+)
 
 
 def main():
@@ -93,6 +107,15 @@ def main():
             orchestrator.run_training()
             diagnostics = orchestrator.get_diagnostics()
             logger.info(f"Causal training diagnostics: {diagnostics}")
+            weight_metrics = diagnostics.get("weight_application_metrics") or {}
+            sampler_metrics = (diagnostics.get("async_sampler_status") or {}).get("metrics", {})
+            logger.info(
+                "Causal runtime summary | state=%s applied=%s skipped_empty=%s sampler_published=%s",
+                diagnostics.get("state"),
+                weight_metrics.get("times_applied"),
+                weight_metrics.get("empty_buffer_skips"),
+                sampler_metrics.get("published_batches"),
+            )
         else:
             trainer.train()
             logger.info("Causal engine disabled; completed standard LoRA training.")

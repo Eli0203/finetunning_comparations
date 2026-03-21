@@ -159,6 +159,34 @@ class TestWeightApplicationLogic:
         assert result is False
         metrics = applier.get_metrics()
         assert metrics['times_applied'] == 0
+        assert metrics['empty_buffer_skips'] == 1
+
+    def test_apply_weights_invalid_payload_type(self):
+        """Invalid payloads should be skipped and counted."""
+        buffer = Mock()
+        buffer.get_latest.return_value = ["not", "a", "dict"]
+        model = SimpleDummyModel()
+        applier = ContinuousWeightApplier(buffer, model, apply_interval=1)
+
+        result = applier.apply_weights(0)
+
+        assert result is False
+        metrics = applier.get_metrics()
+        assert metrics['invalid_payload_skips'] == 1
+
+    def test_apply_weights_nan_tensor_replaced(self):
+        """NaN values in payload should be replaced and tracked."""
+        buffer = Mock()
+        bad_tensor = torch.full((32, 64), float('nan'))
+        buffer.get_latest.return_value = {'linear1.weight': bad_tensor}
+        model = SimpleDummyModel()
+        applier = ContinuousWeightApplier(buffer, model, apply_interval=1)
+
+        result = applier.apply_weights(0)
+
+        assert result is True
+        metrics = applier.get_metrics()
+        assert metrics['nan_replacements'] >= 1
 
 
 class TestRateLimitingLogic:
