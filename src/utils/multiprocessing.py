@@ -6,6 +6,7 @@ used throughout the finetuning pipeline.
 
 from dataclasses import dataclass
 import multiprocessing as py_mp
+from multiprocessing.context import BaseContext
 import sys
 import torch.multiprocessing as mp
 
@@ -64,7 +65,7 @@ def configure_spawn_context() -> MultiprocessingSetupResult:
     return MultiprocessingContextConfigurator.configure_start_method("spawn")
 
 
-def get_spawn_context() -> mp.context.BaseContext:
+def get_spawn_context() -> BaseContext:
     """Return the explicit spawn context used by IPC primitives."""
     return mp.get_context("spawn")
 
