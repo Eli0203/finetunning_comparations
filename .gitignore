@@ -48,6 +48,7 @@ Thumbs.db
 .pytest_cache/
 .ruff_cache/
 
-# Markdown files
+# Markdown files — ignore most docs, but keep governance and top-level entry points
 *.md
 !README.md
+!CONSTITUTION.md
