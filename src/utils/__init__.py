@@ -6,8 +6,8 @@ from src.utils.training_integrator import ContinuousWeightApplier, TrainingBudge
 from src.utils.logger import logger
 from src.utils.math_utils import CausalMath, LaplaceMath
 from src.utils.metrics import natural_indirect_effect
-from src.utils.memory_manager import MemoryOptimizer, DoubleBuffer
-from src.utils.hf_manager import HFDatasetManager
+from src.utils.memory_manager import MemoryOptimizer
+from src.utils.multiprocessing import DoubleBuffer
 
 __all__ = [
     'CausalWeightSampler',
@@ -20,5 +20,4 @@ __all__ = [
     'natural_indirect_effect',
     'MemoryOptimizer',
     'DoubleBuffer',
-    'HFDatasetManager',
 ]
