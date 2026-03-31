@@ -1,0 +1,13 @@
+body {
+    background-color: #f0f0f0; /* Fondo gris para resaltar el "papel" */
+    display: flex;
+    justify-content: center;
+}
+.vscode-body {
+    background-color: white;
+    width: 210mm; /* Ancho A4 */
+    min-height: 297mm;
+    padding: 20mm;
+    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    margin: 20px auto;
+}
