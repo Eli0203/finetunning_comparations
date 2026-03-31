@@ -332,8 +332,11 @@ Current validation snapshot on March 31, 2026 (governance/documentation-alignmen
 - `uv run pytest -q` — 129 tests passing
 - Constitution v1.1.1 — all 11 documented gaps resolved (H2 code fix applied)
 - Notebook imports — 100% aligned with `src/`
+<<<<<<< HEAD
 
 > Note: the snapshot date refers to the `src/` and test suite state. The notebook was reviewed and documentation updated on March 24, 2026.
+=======
+>>>>>>> governance/documentation-alignment
 
 ---
 
@@ -360,15 +363,19 @@ The current source of truth for implemented behavior is:
 5. `CONSISTENCY_REPORT.md` — alignment audit with gap inventory and score
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 After any change to `src/` or canonical docs, re-run `/speckit.analyze` and update
 `CONSISTENCY_REPORT.md`. Alignment score must remain ≥ 90% (Principle VI).
 
+=======
+>>>>>>> governance/documentation-alignment
 =======
 >>>>>>> governance/documentation-alignment
 Older planning and milestone documents remain useful as historical records, but they may describe intermediate project states.
 
 ---
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 ## Creating a New Feature (Spec-Driven Development Workflow)
 
@@ -551,6 +558,8 @@ Before merging, verify:
 | Implement | `/speckit.implement` | Code in `src/`, tests in `tests/` |
 | Checklist | `/speckit.checklist` | Feature-specific QA checklist |
 =======
+=======
+>>>>>>> governance/documentation-alignment
 ## Governance
 
 This project follows a constitution-governed workflow. The constitution lives in [.specify/memory/constitution.md](.specify/memory/constitution.md) (v1.1.1).
@@ -558,5 +567,9 @@ This project follows a constitution-governed workflow. The constitution lives in
 Key rules:
 - `plan.md` and `tasks.md` must never contradict `src/` (Principle VI)
 - Notebook results must be reproducible from the current `src/` (Principle VII)
+<<<<<<< HEAD
+- All code uses strict OOP/SOLID/DI and always runs under `uv` (Principle VIII)
+>>>>>>> governance/documentation-alignment
+=======
 - All code uses strict OOP/SOLID/DI and always runs under `uv` (Principle VIII)
 >>>>>>> governance/documentation-alignment

@@ -54,5 +54,9 @@ Thumbs.db
 # Markdown files — ignore most docs, but keep governance and top-level entry points
 *.md
 !README.md
+<<<<<<< HEAD
+!CONSTITUTION.md
+>>>>>>> governance/documentation-alignment
+=======
 !CONSTITUTION.md
 >>>>>>> governance/documentation-alignment

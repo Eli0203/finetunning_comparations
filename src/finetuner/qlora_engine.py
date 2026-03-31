@@ -4,6 +4,14 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 
 class QLoraEngine:
+    """4-bit NF4 QLoRA engine.
+
+    Constitution constraint: requires a CUDA GPU with >= 8 GB VRAM.
+    Raises RuntimeError at construction time on CPU-only or MPS-only hosts so
+    callers receive a clear message rather than a cryptic bitsandbytes error
+    deep inside the forward pass.
+    """
+
     def __init__(self, model_id: str, rank: int, alpha: int, dropout: float):
         if not torch.cuda.is_available():
             raise RuntimeError(
