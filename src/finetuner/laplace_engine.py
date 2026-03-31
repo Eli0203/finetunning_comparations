@@ -67,7 +67,7 @@ class LaplaceLoRAEngine:
         for name, (A, G) in self.curvature_factors.items():
             # Sumamos los log-determinantes de cada bloque Kronecker [3]
             total_log_det += float(LaplaceMath.log_det_kfac_low_rank(
-                A, G, 1.0/self.prior_precision, n_lora=self.lora_engine._config.r, d=A.size(0)
+                A, G, 1.0/self.prior_precision, n_lora=self.lora_engine.lora_rank, d=A.size(0)
             ))
 
         # Ecuación 14: Log-Evidencia [5, 9]

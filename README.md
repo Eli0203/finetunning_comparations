@@ -262,10 +262,12 @@ The async sampling path now uses an explicit `spawn` multiprocessing context, a 
 
 ### Validation snapshot
 
-Current validation snapshot on March 20, 2026:
+Current validation snapshot on March 31, 2026 (governance/documentation-alignment re-audit):
 
-- `uv run ruff check src tests` passed
-- `uv run pytest -q` passed with 129 tests
+- `uv run ruff check src tests` — clean
+- `uv run pytest -q` — 129 tests passing
+- Constitution v1.1.1 — all 11 documented gaps resolved (H2 code fix applied)
+- Notebook imports — 100% aligned with `src/`
 
 ---
 
@@ -276,6 +278,8 @@ Current validation snapshot on March 20, 2026:
 - [MULTIPROCESSING_DUMMIES_GUIDE.md](MULTIPROCESSING_DUMMIES_GUIDE.md): beginner-friendly guide to multiprocessing, traceability issues, and safe fixes in this repo
 - [specs/feature_causal_lora/tasks.md](specs/feature_causal_lora/tasks.md): implementation status and task history
 - [PHASE_6_COMPLETION.md](PHASE_6_COMPLETION.md): final polish-phase summary
+- [CONSISTENCY_REPORT.md](CONSISTENCY_REPORT.md): documentation/code alignment audit results
+- [NEW_FEATURE_SDD_GUIDE.md](NEW_FEATURE_SDD_GUIDE.md): step-by-step guide for adding a new feature using Spec-Driven Development
 
 ---
 
@@ -289,3 +293,14 @@ The current source of truth for implemented behavior is:
 4. `specs/feature_causal_lora/tasks.md`
 
 Older planning and milestone documents remain useful as historical records, but they may describe intermediate project states.
+
+---
+
+## Governance
+
+This project follows a constitution-governed workflow. The constitution lives in [.specify/memory/constitution.md](.specify/memory/constitution.md) (v1.1.1).
+
+Key rules:
+- `plan.md` and `tasks.md` must never contradict `src/` (Principle VI)
+- Notebook results must be reproducible from the current `src/` (Principle VII)
+- All code uses strict OOP/SOLID/DI and always runs under `uv` (Principle VIII)
