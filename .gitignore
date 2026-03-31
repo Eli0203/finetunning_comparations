@@ -1,62 +1,15 @@
-# Ignore everything
+# Ignore everything by default
 *
 
-<<<<<<< HEAD
-# Keep these files and folders
+# Keep the ignore file itself
 !.gitignore
-!main.py
-!README.md
+
+# Keep allowed source and test trees
 !src/
 !src/**
 !tests/
 !tests/**
-=======
-# VS Code and Notebooks
-.vscode/
-.idea/
-.ipynb_checkpoints/
-*.swp
 
-# Results and outputs
-final_model_LoRA/
-output_LoRA/
-output_mrpc/
-output/
-results_LoRA/
-data/
-logs/
-finetuning.log
-*.log
-specs/
-.specify/
-.specific/
-finetunning.ipynb
-*.safetensors
-*.pt
-*.pth
-training_args.bin
-trainer_state.json
-# config files — exclude real .env files (contain secrets)
-# .env.example is INTENTIONALLY tracked (template with placeholders)
-.env
-.env.local
-.env.production
-.env.staging
-.env.*.local
-
-# OS and temp files
-.DS_Store
-Thumbs.db
-*.tmp
-.pytest_cache/
-.ruff_cache/
-
-# Markdown files — ignore most docs, but keep governance and top-level entry points
-*.md
+# Keep README
 !README.md
-<<<<<<< HEAD
-!CONSTITUTION.md
->>>>>>> governance/documentation-alignment
-=======
-!CONSTITUTION.md
->>>>>>> governance/documentation-alignment
+!readme.md
