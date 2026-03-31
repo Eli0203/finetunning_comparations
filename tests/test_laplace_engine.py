@@ -40,11 +40,12 @@ class TinyLaplaceModel(nn.Module):
 
 def build_lora_engine_stub():
     model = TinyLaplaceModel()
-    return types.SimpleNamespace(
+    stub = types.SimpleNamespace(
         peft_model=model,
         _config=types.SimpleNamespace(r=4),
         lora_rank=4,
     )
+    return stub
 
 
 def test_accumulate_curvature_collects_hook_factors():

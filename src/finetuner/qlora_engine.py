@@ -2,10 +2,15 @@ import torch
 from transformers import AutoModelForSequenceClassification, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-class QLoraEngine:
-    """Loads a 4-bit quantized model and applies LoRA adapters for memory-efficient fine-tuning."""
 
+class QLoraEngine:
     def __init__(self, model_id: str, rank: int, alpha: int, dropout: float):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "QLoraEngine requires a CUDA GPU with >= 8 GB VRAM. "
+                "No CUDA device was detected on this host. "
+                "Use FineTuningEngine (standard LoRA) for CPU/MPS environments."
+            )
         self.model_id = model_id
         self.rank = rank
         self.alpha = alpha

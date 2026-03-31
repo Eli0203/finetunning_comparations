@@ -29,11 +29,6 @@ class FineTuningEngine:
             lora_dropout=dropout
         )
 
-        @property
-        def lora_rank(self) -> int:
-            """Public accessor for the LoRA decomposition rank."""
-            return self._config.r
-
     def apply_lora(self):
         """Wraps the model with LoRA layers to enable parameter-efficient fine-tuning [7, 8]."""
         logger.info(f"Applying LoRA (r={self._config.r}, alpha={self._config.lora_alpha}) to base model...")
