@@ -5,7 +5,7 @@ Integrates causal inference with LoRA fine-tuning for Bayesian optimization.
 
 import torch
 import torch.nn as nn
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Protocol
 from src.finetuner.lora_engine import FineTuningEngine
 from src.utils.math_utils import LaplaceMath
 from src.utils.logger import logger
@@ -13,6 +13,30 @@ from src.utils.logger import logger
 
 class CausalGradientUnavailableError(RuntimeError):
     """Raised when causal path detection cannot populate gradients."""
+
+
+class BudgetAllocationStrategy(Protocol):
+    """Strategy contract for allocating a sampling budget across causal paths."""
+
+    def allocate(self, causal_paths: List[str], total_budget: int) -> Dict[str, int]:
+        """Return budget assignments for each causal path."""
+
+
+class EqualBudgetAllocationStrategy:
+    """Default budget allocation strategy with even distribution and remainder balancing."""
+
+    def allocate(self, causal_paths: List[str], total_budget: int) -> Dict[str, int]:
+        if total_budget < 0:
+            raise ValueError("total_budget must be >= 0")
+        if not causal_paths:
+            return {}
+
+        base_allocation = total_budget // len(causal_paths)
+        remainder = total_budget % len(causal_paths)
+        return {
+            path: base_allocation + (1 if idx < remainder else 0)
+            for idx, path in enumerate(causal_paths)
+        }
 
 
 class CausalMonteCLoRAEngine:
@@ -27,7 +51,8 @@ class CausalMonteCLoRAEngine:
         self,
         lora_engine: FineTuningEngine,
         causal_threshold: float = 0.1,
-        sample_budget: int = 1000
+        sample_budget: int = 1000,
+        budget_strategy: Optional[BudgetAllocationStrategy] = None,
     ):
         """
         Initialize the causal engine with dependency injection.
@@ -40,6 +65,7 @@ class CausalMonteCLoRAEngine:
         self.lora_engine = lora_engine
         self.causal_threshold = causal_threshold
         self.sample_budget = sample_budget
+        self._budget_strategy = budget_strategy or EqualBudgetAllocationStrategy()
         self.causal_paths: List[str] = []
         self.budget_allocation: Dict[str, int] = {}
         self._warmup_state: Dict[str, Any] = {
@@ -193,15 +219,7 @@ class CausalMonteCLoRAEngine:
             logger.warning("No causal paths provided, using equal allocation")
             return {}
 
-        # For now, use equal allocation - can be enhanced with NIE scores later
-        base_allocation = total_budget // len(causal_paths)
-        remainder = total_budget % len(causal_paths)
-
-        allocation = {}
-        for i, path in enumerate(causal_paths):
-            # Distribute remainder across first few paths
-            extra = 1 if i < remainder else 0
-            allocation[path] = base_allocation + extra
+        allocation = self._budget_strategy.allocate(causal_paths, total_budget)
 
         self.budget_allocation = allocation
         logger.info(f"Budget allocation: {allocation}")

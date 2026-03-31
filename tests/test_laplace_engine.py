@@ -43,6 +43,7 @@ def build_lora_engine_stub():
     return types.SimpleNamespace(
         peft_model=model,
         _config=types.SimpleNamespace(r=4),
+        lora_rank=4,
     )
 
 

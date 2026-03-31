@@ -215,7 +215,7 @@ class CausalTrainingOrchestrator:
             causal_paths = self.causal_engine.identify_causal_paths(
                 model, data_loader
             )
-            logger.info(f"[1/7] ✓ Identified {len(causal_paths)} causal paths")
+            logger.info(f"[1/7] [OK] Identified {len(causal_paths)} causal paths")
             # Log first few paths for diagnostics (handle dict/list returns from mocks)
             paths_to_log = list(causal_paths) if isinstance(causal_paths, (list, tuple)) else list(causal_paths.keys()) if isinstance(causal_paths, dict) else causal_paths
             for i, path in enumerate(paths_to_log[:5], 1):
@@ -230,7 +230,7 @@ class CausalTrainingOrchestrator:
                 self.config.total_causal_budget
             )
             budget_summary = self.causal_engine.budget_allocation
-            logger.info(f"[2/7] ✓ Allocated budget across {len(budget_summary)} paths")
+            logger.info(f"[2/7] [OK] Allocated budget across {len(budget_summary)} paths")
             for path, budget in list(budget_summary.items())[:3]:
                 logger.debug(f"      {path}: {budget} samples")
 
@@ -238,12 +238,12 @@ class CausalTrainingOrchestrator:
             # This eliminates the "no budget allocation" warning that fires when
             # the sampler is constructed before prepare() is called.
             self.causal_sampler.refresh_path_weights()
-            logger.info("[2/7] ✓ Sampler path weights refreshed from causal budget")
+            logger.info("[2/7] [OK] Sampler path weights refreshed")
             
             # Step 3: Create double buffer for inter-process communication
             logger.info("[3/7] Creating double buffer for weight communication (O(1) retrieval)...")
             self.buffer = MemoryOptimizer.create_double_buffer()
-            logger.info("[3/7] ✓ Double buffer created")
+            logger.info("[3/7] [OK] Double buffer created")
             
             # Step 4: Create and start background sampler
             logger.info("[4/7] Starting background weight sampler (async multiprocessing)...")
@@ -255,7 +255,7 @@ class CausalTrainingOrchestrator:
             )
             self.async_sampler.start()
             self.async_sampler.raise_if_failed()
-            logger.info(f"[4/7] ✓ Background sampler started ({self.config.async_max_steps} max steps)")
+            logger.info(f"[4/7] [OK] Background sampler started ({self.config.async_max_steps} max steps)")
             
             # Step 5: Create weight applier
             logger.info("[5/7] Creating continuous weight applier (rate-limited application)...")
@@ -265,12 +265,12 @@ class CausalTrainingOrchestrator:
                 device=self.config.device,
                 apply_interval=self.config.apply_interval
             )
-            logger.info(f"[5/7] ✓ Weight applier configured (interval: {self.config.apply_interval} steps)")
+            logger.info(f"[5/7] [OK] Weight applier configured (interval: {self.config.apply_interval} steps)")
             
             # Step 6: Create budget monitor
             logger.info("[6/7] Creating training budget monitor (utilization tracking)...")
             self.budget_monitor = TrainingBudgetMonitor(self.causal_engine)
-            logger.info("[6/7] ✓ Budget monitor initialized")
+            logger.info("[6/7] [OK] Budget monitor initialized")
             
             # Step 7: Register trainer callback for weight application
             logger.info("[7/7] Registering weight application callback with HuggingFace Trainer...")
@@ -279,12 +279,12 @@ class CausalTrainingOrchestrator:
                 sampler_health_check=self.async_sampler.raise_if_failed,
             )
             self.trainer.add_callback(self.weight_callback)
-            logger.info("[7/7] ✓ Callback registered")
+            logger.info("[7/7] [OK] Callback registered")
             
             # Update state
             self._state = self.SAMPLING
             logger.info("=" * 60)
-            logger.info("✓ Orchestrator ready for training (SAMPLING state)")
+            logger.info("[OK] Orchestrator ready for training (SAMPLING state)")
             logger.info("  - Async sampler running in background")
             logger.info("  - Weights will apply every {} steps".format(self.config.apply_interval))
             logger.info("=" * 60)

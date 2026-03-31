@@ -3,6 +3,7 @@ Logger Utility
 author: Eliana Vallejo
 """
 
+import io
 import logging
 import sys
 from typing import Protocol
@@ -13,14 +14,26 @@ class LoggerProtocol(Protocol):
     def error(self, msg: str, *args, **kwargs): ...
 
 class AppLogger:
+    """UTF-8 safe application logger with console and file handlers."""
+
     def __init__(self, name: str = "FineTuningApp"):
         self._logger = logging.getLogger(name)
         if not self._logger.hasHandlers():
             self._logger.setLevel(logging.DEBUG)
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             
-            # Console: INFO and above [1]
-            console = logging.StreamHandler(sys.stdout)
+            # Console: INFO and above — force UTF-8 so Unicode symbols (e.g. ✓)
+            # do not crash on Windows where the default encoding is CP1252.
+            if hasattr(sys.stdout, "buffer"):
+                _stdout_utf8 = io.TextIOWrapper(
+                    sys.stdout.buffer,
+                    encoding="utf-8",
+                    errors="replace",
+                    line_buffering=True,
+                )
+            else:
+                _stdout_utf8 = sys.stdout  # already a non-binary stream (e.g. StringIO in tests)
+            console = logging.StreamHandler(_stdout_utf8)
             console.setLevel(logging.INFO)
             console.setFormatter(formatter)
             self._logger.addHandler(console)

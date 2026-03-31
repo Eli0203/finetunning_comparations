@@ -1,53 +1,11 @@
-# virtual environment and Python cache
-.venv/
-venv/
-__pycache__/
-*.py[oc]
-*.pyd
-*.egg-info/
-dist/
-build/
+# Ignore everything
+*
 
-# VS Code and Notebooks
-.vscode/
-.idea/
-.ipynb_checkpoints/
-*.swp
-
-# Results and outputs
-final_model_LoRA/
-output_LoRA/
-output_mrpc/
-output/
-results_LoRA/
-data/
-logs/
-finetuning.log
-*.log
-specs/
-.specify/
-.specific/
-finetunning.ipynb
-*.safetensors
-*.pt
-*.pth
-training_args.bin
-trainer_state.json
-# config files — exclude real .env files (contain secrets)
-# .env.example is INTENTIONALLY tracked (template with placeholders)
-.env
-.env.local
-.env.production
-.env.staging
-.env.*.local
-
-# OS and temp files
-.DS_Store
-Thumbs.db
-*.tmp
-.pytest_cache/
-.ruff_cache/
-
-# Markdown files
-*.md
+# Keep these files and folders
+!.gitignore
+!main.py
 !README.md
+!src/
+!src/**
+!tests/
+!tests/**

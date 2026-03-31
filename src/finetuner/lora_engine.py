@@ -12,6 +12,8 @@ class ModelConfig(Protocol):
     model_name: str
 
 class FineTuningEngine:
+    """Wraps a Hugging Face model with LoRA parameter-efficient adapters."""
+
     # FIXED: Constructor now accepts the 5 arguments passed in main.py
     def __init__(self, task_type: TaskType, model, rank: int, alpha: int, dropout: float):
         self.model = model
@@ -26,6 +28,11 @@ class FineTuningEngine:
             target_modules=["query", "value"], # Target attention layers [6]
             lora_dropout=dropout
         )
+
+        @property
+        def lora_rank(self) -> int:
+            """Public accessor for the LoRA decomposition rank."""
+            return self._config.r
 
     def apply_lora(self):
         """Wraps the model with LoRA layers to enable parameter-efficient fine-tuning [7, 8]."""

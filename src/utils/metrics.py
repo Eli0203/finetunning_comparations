@@ -6,6 +6,7 @@ from typing import Dict
 class UnifiedEvaluator:
     """Standardized evaluation engine for LoRA and Bayesian Laplace-LoRA [3]."""
     def __init__(self, task_name: str):
+        """Initialize GLUE metric adapters and calibration settings for one task."""
         self.task_name = task_name.lower()
         self.glue_metric = evaluate.load("glue", self.task_name) # [11]
         self.n_bins = 10 # Standard for ECE computation [5]

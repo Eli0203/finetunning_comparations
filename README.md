@@ -6,21 +6,44 @@ Research-oriented fine-tuning workspace for GLUE-style sequence classification w
 - an optional causal LoRA orchestration pipeline wired behind a settings flag
 - legacy or experimental Laplace and QLoRA components that exist as library modules but are not currently used by `main.py`
 
-**Status**: Project implementation complete through Phase 7. Documentation refreshed from the current `src/` tree on March 20, 2026.
+**Status**: Project implementation complete through Phase 7. Documentation refreshed from the current `src/` tree on March 24, 2026.
+
+## Project Governance
+
+Delivery standards for architecture boundaries, UV-managed execution, testing,
+memory-safe async behavior, and documentation synchronization are defined in
+`.specify/memory/constitution.md`. Planning and implementation artifacts are
+expected to satisfy the constitution gates before work is considered complete.
 
 ---
 
 ## What This Repository Does
 
-At runtime, the project loads a GLUE dataset, tokenizes sentence pairs, wraps a Hugging Face classification model with LoRA adapters, and trains it with `transformers.Trainer`.
+The repository exposes **two entry points** for fine-tuning and evaluation:
 
-If `EXECUTE_CAUSAL_ENGINE=true`, the runtime switches from plain LoRA training to a causal orchestration path that:
+### `main.py` — scripted single-task entry point
+
+Loads a GLUE dataset, tokenizes sentence pairs, wraps a Hugging Face classification model with LoRA adapters, and trains with `transformers.Trainer`.
+
+If `EXECUTE_CAUSAL_ENGINE=true`, switches from plain LoRA training to a causal orchestration path that:
 
 1. identifies causal paths in the adapted model
 2. allocates a causal sampling budget
 3. starts an asynchronous weight sampler backed by a double buffer
 4. applies sampled weights during training at a fixed interval
 5. reports diagnostics, budget utilization, warm-up state, and marginal-likelihood estimates
+
+### `finetunning.ipynb` — interactive benchmark notebook
+
+A production-ready Jupyter notebook that benchmarks **three fine-tuning methods** across **three GLUE tasks** (MRPC, SST-2, QNLI) in a single session:
+
+| Method | Description |
+|--------|-------------|
+| **LoRA Baseline** | Standard cross-entropy training on LoRA adapters |
+| **Laplace-LoRA** | MAP training followed by K-FAC Hessian posterior for calibrated uncertainty |
+| **Causal FT** | Do-calculus reweighted training for structural invariance |
+
+The notebook is fault-tolerant by design: it prefers Google Drive when running on Colab, saves step-based checkpoints, resumes from the latest checkpoint on reconnect, and snapshots results to disk after every completed task.
 
 ---
 
@@ -37,18 +60,21 @@ If `EXECUTE_CAUSAL_ENGINE=true`, the runtime switches from plain LoRA training t
 - `src/utils/logger.py`
 - `src/utils/metrics.py`
 
-### Present in `src/` and used transitively by the causal path
+### Actively used by `finetunning.ipynb` (additionally)
 
-- `src/finetuner/laplace_engine.py`
-- `src/finetuner/qlora_engine.py`
+- `src/finetuner/laplace_engine.py` — Laplace-LoRA benchmark method
+- `src/utils/memory_manager.py` — `MemoryOptimizer.log_resource_usage` called after each experiment
+- `src/utils/multiprocessing.py` — `configure_spawn_context` called at notebook startup
+
+### Used transitively by the causal orchestration path
+
+- `src/finetuner/qlora_engine.py` *(not wired into either entry point; present as a library module)*
 - `src/utils/math_utils.py`
 - `src/utils/async_sampler.py`
 - `src/utils/training_integrator.py`
-- `src/utils/memory_manager.py`
-- `src/utils/multiprocessing.py`
 - `src/utils/hf_manager.py`
 
-These modules are not imported directly by `main.py`, but they are part of the active causal execution path through `CausalTrainingOrchestrator` and are covered by the test suite.
+These modules are part of the active causal execution path through `CausalTrainingOrchestrator` and are covered by the test suite.
 
 ---
 
@@ -124,15 +150,34 @@ The codebase follows a composition model:
 
 ### Common optional environment variables
 
+**Used by `main.py` and `finetunning.ipynb`**:
+
 - `MODEL_ID`
 - `TASK_NAME`
 - `BATCH_SIZE`
 - `EPOCHS`
 - `LEARNING_RATE`
 - `OUTPUT_DIR`
+- `LOGGING_DIR`
+- `LORA_RANK`
+- `LORA_ALPHA`
+- `LORA_DROPOUT`
 - `EXECUTE_CAUSAL_ENGINE`
 - `EXECUTE_LAPLACE`
 - `EXECUTE_QLORA`
+- `TOTAL_CAUSAL_BUDGET`
+- `ASYNC_MAX_STEPS`
+- `APPLY_INTERVAL`
+
+**Used by `finetunning.ipynb` only** (multi-task benchmark extras):
+
+- `GRADIENT_ACCUMULATION_STEPS` — gradient accumulation steps per optimizer update
+- `SAVE_STEPS` — checkpoint save frequency in steps (default: 100)
+- `EVAL_STEPS` — evaluation frequency in steps (default: 100)
+- `LOGGING_STEPS` — log frequency in steps (default: 25)
+- `MAX_STEPS` — hard step limit overriding epoch count (-1 = unlimited)
+- `RESUME_POLICY` — checkpoint resume strategy (`latest`, `auto`, `true`, or `false`)
+- `SEED` — random seed for reproducibility (default: 42)
 
 ---
 
@@ -155,9 +200,9 @@ uv sync
 
 ## Running The Project
 
-The current entry point is `main.py` and it is driven by settings rather than a real CLI parser.
+Both entry points are settings-driven rather than argparse-based.
 
-### Standard LoRA run
+### `main.py` — Standard LoRA run
 
 ```powershell
 $env:HF_TOKEN = "<your-token>"
@@ -167,7 +212,7 @@ $env:EXECUTE_CAUSAL_ENGINE = "false"
 uv run python main.py
 ```
 
-### Causal orchestration run
+### `main.py` — Causal orchestration run
 
 ```powershell
 $env:HF_TOKEN = "<your-token>"
@@ -184,6 +229,25 @@ What changes when causal mode is enabled:
 - `CausalTrainingOrchestrator.prepare()` initializes the async pipeline
 - training proceeds through a callback that periodically applies weights to the live model
 - diagnostics are logged after training, including async sampler health and callback-visible errors
+
+**Note**: the causal config values in `main.py` (`sample_budget`, `total_causal_budget`, `async_max_steps`, `apply_interval`) are currently hardcoded at 1000 / 100 / 10. The notebook reads these from env vars (`TOTAL_CAUSAL_BUDGET`, `ASYNC_MAX_STEPS`, `APPLY_INTERVAL`).
+
+### `finetunning.ipynb` — Interactive benchmark
+
+Open the notebook in Jupyter or VS Code and run cells in order:
+
+1. Cell 2 (Bootstrap) — installs `uv` on Colab, no-op locally
+2. Cell 3 (Environment detection) — resolves `base_dir`, `output_dir`, etc.
+3. Cell 4 (Project install) — reads `pyproject.toml`; on Colab installs editable, on local shows installed packages
+4. Cell 5 (Runtime env) — sets all env vars from Python dict; set `HF_TOKEN` here
+5. Cell 6 (Imports) — imports the full `src/` surface
+6. Cell 7 (Config) — builds `LoRAExperimentConfig` instances for mrpc, sst2, qnli
+7. Cell 8 (Data helpers) — wraps `GLUEDataLoader` for notebook use
+8. Cell 10 (Utilities) — runtime-state persistence, checkpoint helpers, `build_training_args`
+9. **Cells 12–13** — LoRA Baseline training and results
+10. **Cells 15–16** — Laplace-LoRA training and results
+11. **Cells 18–19** — Causal FT training and results
+12. Cell 21 — Benchmark results table and bar charts
 
 ---
 
@@ -267,6 +331,8 @@ Current validation snapshot on March 20, 2026:
 - `uv run ruff check src tests` passed
 - `uv run pytest -q` passed with 129 tests
 
+> Note: the snapshot date refers to the `src/` and test suite state. The notebook was reviewed and documentation updated on March 24, 2026.
+
 ---
 
 ## Recommended Reading
@@ -287,5 +353,192 @@ The current source of truth for implemented behavior is:
 2. `README.md`
 3. `SOURCE_CODE_DOCUMENTATION.md`
 4. `specs/feature_causal_lora/tasks.md`
+5. `CONSISTENCY_REPORT.md` — alignment audit with gap inventory and score
+
+After any change to `src/` or canonical docs, re-run `/speckit.analyze` and update
+`CONSISTENCY_REPORT.md`. Alignment score must remain ≥ 90% (Principle VI).
 
 Older planning and milestone documents remain useful as historical records, but they may describe intermediate project states.
+
+---
+
+## Creating a New Feature (Spec-Driven Development Workflow)
+
+This project uses **Spec-Driven Development (SDD)** via the `speckit` agent suite. Every new feature must pass through the following stages before implementation begins.
+
+### Prerequisites
+
+- You are on a dedicated feature branch.
+- `uv sync` has been run and the virtual environment is active.
+- Governance branch reviewed: `specs/feature_causal_lora/plan_documentation_alignment.md`.
+
+---
+
+### Stage 1 — Branch
+
+```powershell
+git checkout -b feature/<your-feature-name>
+```
+
+Convention: `feature/verb-noun` (e.g. `feature/add-qnli-strategy`).
+
+---
+
+### Stage 2 — Specify
+
+Open GitHub Copilot Chat and run:
+
+```
+/speckit.specify
+```
+
+Describe the feature in plain language. The agent creates:
+
+```
+specs/feature_<your-feature-name>/spec.md
+```
+
+The spec captures: objective, scope, functional requirements, acceptance criteria,
+and user stories. It is the single source-of-truth for *what* you are building.
+
+---
+
+### Stage 3 — Clarify (optional but recommended)
+
+```
+/speckit.clarify
+```
+
+The agent asks up to 5 targeted questions about underspecified areas, then encodes
+the answers back into `spec.md`. Run this before planning.
+
+---
+
+### Stage 4 — Plan
+
+```
+/speckit.plan
+```
+
+The agent reads `spec.md` and produces:
+
+```
+specs/feature_<your-feature-name>/
+├── plan.md            ← design decisions, phased tasks, constitution check
+├── research.md        ← background analysis
+├── data-model.md      ← class/data contracts
+├── quickstart.md      ← fast-start usage guide
+└── contracts/         ← interface contracts (optional)
+```
+
+**Constitution gate** runs automatically inside `plan.md`. All 8 principles must
+pass before Phase 1 outputs are approved.
+
+---
+
+### Stage 5 — Generate Tasks
+
+```
+/speckit.tasks
+```
+
+Produces a dependency-ordered `tasks.md` with every task mapped to a user story,
+an implementation path, and a validation command. No task may reference a symbol
+not present in `src/`.
+
+---
+
+### Stage 6 — Analyze Artifacts
+
+```
+/speckit.analyze
+```
+
+Cross-checks `spec.md`, `plan.md`, and `tasks.md` for:
+
+- API signatures that diverge from `src/` (Principle VI)
+- Missing OOP/SOLID patterns (Principle VIII)
+- Undocumented tests or missing artifacts (Principle V)
+
+Resolve all CRITICAL and HIGH findings before proceeding.
+
+---
+
+### Stage 7 — Implement
+
+```
+/speckit.implement
+```
+
+Executes each task in `tasks.md` in order. Follow these rules during implementation:
+
+| Rule | Detail |
+|------|--------|
+| One class per file | `src/finetuner/` and `src/utils/` follow single-responsibility |
+| Protocol-first | Define a `Protocol` before the concrete class |
+| Dependency injection | Engines receive collaborators via constructor |
+| Settings via `Settings` | Use `src/settings/settings.py`; never hardcode |
+| All commands via `uv` | `uv run pytest`, `uv add`, `uv sync` |
+
+---
+
+### Stage 8 — Test
+
+```powershell
+uv run pytest                                 # full suite
+uv run pytest tests/test_<your_module>.py -v  # targeted
+```
+
+New behavior **must** have tests. Documentation-only changes may skip tests (Principle III).
+
+---
+
+### Stage 9 — Update Docs & Re-analyze
+
+Update `README.md` → `Source Tree Guide` and `SOURCE_CODE_DOCUMENTATION.md` with
+any new classes or modules.
+
+Then run `/speckit.analyze` once more to confirm 0 CRITICAL gaps and alignment
+score ≥ 90%.
+
+---
+
+### Stage 10 — Update Constitution (if governance changed)
+
+```
+/speckit.constitution
+```
+
+Only needed if the feature introduces a new global contract (e.g. a new required
+pattern, a new entry point, a new hardware constraint).
+
+---
+
+### Stage 11 — Commit & Merge
+
+```powershell
+git add src/ tests/ specs/ README.md SOURCE_CODE_DOCUMENTATION.md
+git commit -m "feat(<scope>): <what it does>"
+```
+
+Before merging, verify:
+
+- [ ] `uv run pytest` passes
+- [ ] `CONSISTENCY_REPORT.md` updated (or alignment check re-run)
+- [ ] `README.md` Source Tree Guide reflects new modules
+- [ ] All spec artifacts reference actual `src/` symbols
+- [ ] No `pip install` or bare `python` calls in new code or docs
+
+---
+
+### Quick Reference Card
+
+| Stage | Command | Output |
+|-------|---------|--------|
+| Specify | `/speckit.specify` | `spec.md` |
+| Clarify | `/speckit.clarify` | Updated `spec.md` |
+| Plan | `/speckit.plan` | `plan.md`, `research.md`, `data-model.md` |
+| Tasks | `/speckit.tasks` | `tasks.md` |
+| Analyze | `/speckit.analyze` | Gap report |
+| Implement | `/speckit.implement` | Code in `src/`, tests in `tests/` |
+| Checklist | `/speckit.checklist` | Feature-specific QA checklist |
