@@ -12,7 +12,11 @@ from src.utils.metrics import UnifiedEvaluator
 from src.utils.causal_sampler import CausalWeightSampler
 from src.finetuner.data_loader import GLUEDataLoader
 from src.finetuner.lora_engine import FineTuningEngine as LoRAEngine
-from src.finetuner.causal_engine import CausalMonteCLoRAEngine
+from src.finetuner.causal_engine import (
+    CausalMonteCLoRAEngine,
+    EqualBudgetAllocationStrategy,
+    TemperatureSoftmaxAllocationStrategy,
+)
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
 from src.settings.settings import CausalTrainingConfig
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
@@ -76,16 +80,6 @@ def main():
         )
 
         if settings.execute_causal_engine:
-            causal_engine = CausalMonteCLoRAEngine(
-                lora_engine=lora_engine,
-                causal_threshold=0.1,
-                sample_budget=1000,
-            )
-            causal_sampler = CausalWeightSampler(
-                causal_engine=causal_engine,
-                model=model_lora,
-                device=settings.device,
-            )
             causal_config = CausalTrainingConfig(
                 total_causal_budget=1000,
                 async_max_steps=100,
@@ -93,6 +87,33 @@ def main():
                 device=settings.device,
                 enable_warmup=False,
                 warmup_steps=10,
+            )
+
+            # Select budget allocation strategy: temperature != 1.0 activates
+            # temperature-scaled softmax; 1.0 (default) uses equal allocation.
+            if causal_config.temperature != 1.0:
+                budget_strategy = TemperatureSoftmaxAllocationStrategy(
+                    temperature=causal_config.temperature
+                )
+                logger.info(
+                    "Using TemperatureSoftmaxAllocationStrategy (τ=%.4f, anneal=%s)",
+                    causal_config.temperature,
+                    causal_config.temperature_anneal,
+                )
+            else:
+                budget_strategy = EqualBudgetAllocationStrategy()
+                logger.info("Using EqualBudgetAllocationStrategy (τ=1.0 sentinel)")
+
+            causal_engine = CausalMonteCLoRAEngine(
+                lora_engine=lora_engine,
+                causal_threshold=0.1,
+                sample_budget=causal_config.total_causal_budget,
+                budget_strategy=budget_strategy,
+            )
+            causal_sampler = CausalWeightSampler(
+                causal_engine=causal_engine,
+                model=model_lora,
+                device=settings.device,
             )
 
             orchestrator = CausalTrainingOrchestrator(

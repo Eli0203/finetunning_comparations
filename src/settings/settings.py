@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from peft import TaskType  
 import torch
 from typing import Any, Optional
@@ -125,6 +125,51 @@ class CausalTrainingConfig(BaseModel):
         default="INFO", 
         description="Logging verbosity level (DEBUG, INFO, WARNING, ERROR)"
     )
+
+    # Temperature-scaled softmax budget allocation
+    temperature: float = Field(
+        default=1.0,
+        description=(
+            "Softmax temperature τ for budget allocation (must be > 0). "
+            "1.0 uses EqualBudgetAllocationStrategy; any other value activates "
+            "TemperatureSoftmaxAllocationStrategy. Higher τ → more uniform weights; "
+            "lower τ → sharper concentration on high-score paths."
+        ),
+        gt=0,
+    )
+    temperature_anneal: bool = Field(
+        default=False,
+        description=(
+            "Enable linear temperature annealing. When True, τ decays linearly "
+            "from `temperature` to `temperature_min` over the training run."
+        ),
+    )
+    temperature_min: float = Field(
+        default=0.1,
+        description=(
+            "Minimum temperature for the annealing schedule (must be > 0). "
+            "Ignored when temperature_anneal=False."
+        ),
+        gt=0,
+    )
+
+    # Warm-up plateau detection
+    warmup_plateau_delta: float = Field(
+        default=1e-4,
+        description=(
+            "Minimum absolute loss decrease required to avoid triggering the "
+            "plateau counter during warm-up. Set to 0 to disable plateau detection."
+        ),
+        ge=0,
+    )
+    warmup_plateau_patience: int = Field(
+        default=3,
+        description=(
+            "Number of consecutive warm-up steps that must show no improvement "
+            "greater than warmup_plateau_delta before early exit is triggered."
+        ),
+        ge=1,
+    )
     
     @field_validator('device')
     @classmethod
@@ -155,6 +200,16 @@ class CausalTrainingConfig(BaseModel):
         if v is not None and v < 1:
             raise ValueError(f"warmup_steps must be >= 1 if provided, got {v}")
         return v
+
+    @model_validator(mode='after')
+    def validate_temperature_annealing(self) -> 'CausalTrainingConfig':
+        """Ensure temperature_min < temperature when annealing is enabled."""
+        if self.temperature_anneal and self.temperature_min >= self.temperature:
+            raise ValueError(
+                f"temperature_min ({self.temperature_min}) must be strictly less than "
+                f"temperature ({self.temperature}) when temperature_anneal=True."
+            )
+        return self
     
     def model_post_init(self, __context: Any) -> None:
         """
