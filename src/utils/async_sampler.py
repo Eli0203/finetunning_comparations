@@ -7,6 +7,7 @@ Supports both random sampling (legacy) and causal-aware sampling (new).
 """
 
 import traceback
+import os
 
 import torch
 import torch.multiprocessing as mp
@@ -67,6 +68,7 @@ class BackgroundSampler:
                             sampling.  If None, falls back to random CPU tensors.
         """
         self.buffer = buffer
+        self._validate_buffer_interface(buffer)
         # Extract CPU-safe parameter metadata; do NOT hold the live model
         # (which may be on CUDA and cannot be pickled for spawn workers).
         self._param_specs: Dict[str, Tuple[torch.Size, torch.dtype]] = {
@@ -86,14 +88,31 @@ class BackgroundSampler:
         self._stop_event = self._context.Event()
         self.max_steps = max_steps
         self.causal_sampler = causal_sampler  # Dependency injection
+        self.worker_count = min(os.cpu_count() or 1, 8)
         self.process: Optional[mp.Process] = None
         self._last_error: Optional[str] = None
         self._stop_requested = False
 
         if causal_sampler is not None:
-            logger.info("BackgroundSampler initialized with causal-aware sampler")
+            logger.info(
+                "BackgroundSampler initialized with causal-aware sampler | buffer=%s | workers=%s",
+                type(buffer).__name__,
+                self.worker_count,
+            )
         else:
-            logger.info("BackgroundSampler initialized with random sampler (legacy)")
+            logger.info(
+                "BackgroundSampler initialized with random sampler (legacy) | buffer=%s | workers=%s",
+                type(buffer).__name__,
+                self.worker_count,
+            )
+
+    @staticmethod
+    def _validate_buffer_interface(buffer: Any) -> None:
+        """Validate IPC buffer exposes the expected put/get_latest API."""
+        if not hasattr(buffer, 'put') or not callable(getattr(buffer, 'put')):
+            raise TypeError("BackgroundSampler buffer must implement callable put(item)")
+        if not hasattr(buffer, 'get_latest') or not callable(getattr(buffer, 'get_latest')):
+            raise TypeError("BackgroundSampler buffer must implement callable get_latest()")
 
     def __getstate__(self) -> Dict[str, Any]:
         """Return worker-safe state for spawn pickling.

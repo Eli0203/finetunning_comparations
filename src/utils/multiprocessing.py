@@ -8,7 +8,9 @@ from dataclasses import dataclass
 import multiprocessing as py_mp
 from multiprocessing.context import BaseContext
 import sys
+from typing import Any, Optional
 import torch.multiprocessing as mp
+from src.utils.logger import logger
 
 
 @dataclass(frozen=True)
@@ -99,3 +101,35 @@ class DoubleBuffer:
         """Return the most recently written item (or None)."""
         with self._lock:
             return self._slots[self._current.value]
+
+
+class RingBuffer:
+    """Spawn-safe ring buffer with O(1) latest-item retrieval."""
+
+    def __init__(self, size: int = 15) -> None:
+        if size < 2:
+            raise ValueError(f"RingBuffer size must be >= 2, got {size}")
+
+        self._size = size
+        ctx = get_spawn_context()
+        manager = ctx.Manager()
+        self._slots = manager.list([None] * size)
+        self._write_ptr = manager.Value("i", -1)
+        # Use manager-backed lock proxy for safer cross-process synchronization.
+        self._lock = manager.Lock()
+
+    def put(self, item: Any) -> None:
+        """Write an item into the next cyclic slot in O(1)."""
+        with self._lock:
+            next_idx = (self._write_ptr.value + 1) % self._size
+            self._slots[next_idx] = item
+            self._write_ptr.value = next_idx
+            logger.debug("RingBuffer: put slot %s", next_idx)
+
+    def get_latest(self) -> Optional[Any]:
+        """Return the latest written item in O(1), or None if empty."""
+        with self._lock:
+            if self._write_ptr.value < 0:
+                return None
+            logger.debug("RingBuffer: get_latest slot %s", self._write_ptr.value)
+            return self._slots[self._write_ptr.value]

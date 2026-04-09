@@ -12,7 +12,12 @@ from src.utils.metrics import UnifiedEvaluator
 from src.utils.causal_sampler import CausalWeightSampler
 from src.finetuner.data_loader import GLUEDataLoader
 from src.finetuner.lora_engine import FineTuningEngine as LoRAEngine
-from src.finetuner.causal_engine import CausalMonteCLoRAEngine
+from src.finetuner.causal_engine import (
+    CausalMonteCLoRAEngine,
+    EqualBudgetAllocationStrategy,
+    TemperatureSoftmaxAllocationStrategy,
+)
+from src.finetuner.nie_strategy import NIEBudgetAllocationStrategy
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
 from src.settings.settings import CausalTrainingConfig
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
@@ -76,24 +81,84 @@ def main():
         )
 
         if settings.execute_causal_engine:
-            causal_engine = CausalMonteCLoRAEngine(
-                lora_engine=lora_engine,
-                causal_threshold=0.1,
-                sample_budget=1000,
-            )
-            causal_sampler = CausalWeightSampler(
-                causal_engine=causal_engine,
-                model=model_lora,
-                device=settings.device,
-            )
             causal_config = CausalTrainingConfig(
                 total_causal_budget=1000,
                 async_max_steps=100,
-                apply_interval=10,
+                apply_interval=settings.apply_interval,
                 device=settings.device,
                 enable_warmup=False,
+                enable_interventional_weights=True,
                 warmup_steps=10,
+                causal_softmax_temp_init=settings.causal_softmax_temp_initial,
+                causal_softmax_temp_final=settings.causal_softmax_temp_final,
+                causal_temp_annealing=(settings.causal_temp_schedule == "linear_decay"),
             )
+
+            # US1: select NIE strategy for causal budgeting in Bayesian mode.
+            if settings.causal_sampler_mode == "mixture_of_gaussians":
+                budget_strategy = NIEBudgetAllocationStrategy(
+                    temp_init=causal_config.causal_softmax_temp_init,
+                    temp_final=causal_config.causal_softmax_temp_final,
+                    apply_interval=causal_config.apply_interval,
+                )
+                logger.info(
+                    "Using NIEBudgetAllocationStrategy (τ_init=%.4f, τ_final=%.4f, anneal=%s)",
+                    causal_config.causal_softmax_temp_init,
+                    causal_config.causal_softmax_temp_final,
+                    causal_config.causal_temp_annealing,
+                )
+            else:
+                initial_tau = causal_config.get_causal_temperature(progress_ratio=0.0)
+                if initial_tau != 1.0 or causal_config.causal_temp_annealing:
+                    budget_strategy = TemperatureSoftmaxAllocationStrategy(
+                        temperature=initial_tau
+                    )
+                    logger.info(
+                        "Using TemperatureSoftmaxAllocationStrategy (τ_init=%.4f, τ_final=%.4f, anneal=%s)",
+                        causal_config.causal_softmax_temp_init,
+                        causal_config.causal_softmax_temp_final,
+                        causal_config.causal_temp_annealing,
+                    )
+                else:
+                    budget_strategy = EqualBudgetAllocationStrategy()
+                    logger.info("Using EqualBudgetAllocationStrategy (τ=1.0 sentinel)")
+
+            causal_engine = CausalMonteCLoRAEngine(
+                lora_engine=lora_engine,
+                causal_threshold=0.1,
+                sample_budget=causal_config.total_causal_budget,
+                budget_strategy=budget_strategy,
+            )
+            if settings.causal_sampler_mode == "mixture_of_gaussians":
+                try:
+                    from src.utils.bayesian_sampler import BayesianCausalSampler
+
+                    causal_sampler = BayesianCausalSampler(
+                        causal_engine=causal_engine,
+                        model=model_lora,
+                        device=settings.device,
+                        enable_pg_pos=settings.enable_pg_pos,
+                        kfac_correlation=settings.kfac_correlation,
+                        random_dirichlet_init=settings.random_dirichlet_init,
+                    )
+                    logger.info("Using BayesianCausalSampler (mixture_of_gaussians)")
+                except Exception as exc:
+                    logger.warning(
+                        "Bayesian sampler mode requested but unavailable (%s). Falling back to gradient sampler.",
+                        exc,
+                    )
+                    causal_sampler = CausalWeightSampler(
+                        causal_engine=causal_engine,
+                        model=model_lora,
+                        device=settings.device,
+                    )
+            else:
+                causal_sampler = CausalWeightSampler(
+                    causal_engine=causal_engine,
+                    model=model_lora,
+                    device=settings.device,
+                )
+                logger.info("Using CausalWeightSampler (gradient)")
 
             orchestrator = CausalTrainingOrchestrator(
                 lora_engine=lora_engine,

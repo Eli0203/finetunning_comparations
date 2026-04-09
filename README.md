@@ -6,7 +6,7 @@ Research-oriented fine-tuning workspace for GLUE-style sequence classification w
 - an optional causal LoRA orchestration pipeline wired behind a settings flag
 - legacy or experimental Laplace and QLoRA components that exist as library modules but are not currently used by `main.py`
 
-**Status**: Project implementation complete through Phase 7. Documentation refreshed from the current `src/` tree on March 24, 2026.
+**Status**: Project implementation complete through Phase 8. Documentation refreshed from the current `src/` tree and UV validation results on April 7, 2026.
 
 ## Project Governance
 
@@ -28,10 +28,10 @@ Loads a GLUE dataset, tokenizes sentence pairs, wraps a Hugging Face classificat
 If `EXECUTE_CAUSAL_ENGINE=true`, switches from plain LoRA training to a causal orchestration path that:
 
 1. identifies causal paths in the adapted model
-2. allocates a causal sampling budget
-3. starts an asynchronous weight sampler backed by a double buffer
-4. applies sampled weights during training at a fixed interval
-5. reports diagnostics, budget utilization, warm-up state, and marginal-likelihood estimates
+2. allocates a causal sampling budget using equal-share or NIE-informed policies
+3. starts an asynchronous weight sampler backed by a 15-slot ring buffer
+4. applies sampled weights during training at a fixed interval with optional interventional weighting
+5. reports diagnostics, budget utilization, warm-up state, and fail-closed marginal-likelihood estimates
 
 ### `finetunning.ipynb` — interactive benchmark notebook
 
@@ -55,8 +55,11 @@ The notebook is fault-tolerant by design: it prefers Google Drive when running o
 - `src/finetuner/lora_engine.py`
 - `src/finetuner/causal_engine.py`
 - `src/finetuner/causal_training_orchestrator.py`
+- `src/finetuner/nie_strategy.py`
 - `src/settings/settings.py`
+- `src/utils/bayesian_sampler.py`
 - `src/utils/causal_sampler.py`
+- `src/utils/hypernetwork.py`
 - `src/utils/logger.py`
 - `src/utils/metrics.py`
 
@@ -95,10 +98,12 @@ These modules are part of the active causal execution path through `CausalTraini
 - `hf_manager.py`: singleton Hugging Face dataset manager with login and in-memory task caching.
 - `math_utils.py`: causal and Laplace math primitives used by the analytical layers.
 - `metrics.py`: GLUE metric evaluation, NLL, ECE, and natural indirect effect computation.
-- `memory_manager.py`: RAM/VRAM reporting, cleanup, and double-buffer helpers.
-- `multiprocessing.py`: `DoubleBuffer` implementation for latest-value inter-process handoff.
-- `async_sampler.py`: background sampling process with legacy random and causal-aware modes.
+- `memory_manager.py`: RAM/VRAM reporting, cleanup, and ring-buffer helpers.
+- `multiprocessing.py`: spawn-safe `RingBuffer` implementation for latest-value inter-process handoff.
+- `async_sampler.py`: background sampling process with dynamic worker capping and causal-aware modes.
+- `bayesian_sampler.py`: MoG Bayesian sampler with Wishart, Dirichlet, and KFAC-aware state.
 - `causal_sampler.py`: causal-budget-aware weight generation for LoRA parameters.
+- `hypernetwork.py`: PG-Pos hypernetwork used for Bayesian LoRA mean generation.
 - `training_integrator.py`: continuous weight application and causal budget monitoring.
 - `__init__.py`: convenience exports for the causal utility layer.
 
@@ -120,12 +125,13 @@ main.py
 
 CausalTrainingOrchestrator
   -> CausalMonteCLoRAEngine
-  -> CausalWeightSampler
+  -> CausalWeightSampler / BayesianCausalSampler
   -> BackgroundSampler
-  -> DoubleBuffer
+  -> RingBuffer(15)
   -> ContinuousWeightApplier
   -> TrainingBudgetMonitor
   -> WeightApplicationCallback
+  -> InterventionalWeightCallback
 ```
 
 The codebase follows a composition model:
@@ -168,6 +174,16 @@ The codebase follows a composition model:
 - `TOTAL_CAUSAL_BUDGET`
 - `ASYNC_MAX_STEPS`
 - `APPLY_INTERVAL`
+- `CAUSAL_SAMPLER_MODE`
+- `RANDOM_DIRICHLET_INIT`
+- `ENABLE_PG_POS`
+- `KFAC_CORRELATION`
+- `CAUSAL_SOFTMAX_TEMP_INITIAL`
+- `CAUSAL_SOFTMAX_TEMP_FINAL`
+- `CAUSAL_TEMP_SCHEDULE`
+- `MAX_RAM_THRESHOLD_GB`
+- `DEFAULT_QUANTIZATION`
+- `ENABLE_INTERVENTIONAL_WEIGHTS`
 
 **Used by `finetunning.ipynb` only** (multi-task benchmark extras):
 
@@ -225,10 +241,14 @@ uv run python main.py
 What changes when causal mode is enabled:
 
 - `CausalMonteCLoRAEngine` is created
-- `CausalWeightSampler` generates causal-budget-scaled weights
+- `CausalWeightSampler` or `BayesianCausalSampler` is selected from settings
 - `CausalTrainingOrchestrator.prepare()` initializes the async pipeline
+- `NIEBudgetAllocationStrategy` can drive budget allocation after warm-up
+- `RingBuffer(15)` backs async sampling instead of the legacy double buffer path
 - training proceeds through a callback that periodically applies weights to the live model
 - diagnostics are logged after training, including async sampler health and callback-visible errors
+
+Additional causal runtime flags now include sampler mode, PG-Pos hypernetwork enablement, KFAC correlation, temperature schedule, RAM ceiling, quantization mode, and interventional weighting.
 
 **Note**: the causal config values in `main.py` (`sample_budget`, `total_causal_budget`, `async_max_steps`, `apply_interval`) are currently hardcoded at 1000 / 100 / 10. The notebook reads these from env vars (`TOTAL_CAUSAL_BUDGET`, `ASYNC_MAX_STEPS`, `APPLY_INTERVAL`).
 
