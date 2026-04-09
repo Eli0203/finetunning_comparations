@@ -63,6 +63,9 @@ class ContinuousWeightApplier:
         self._invalid_payload_skips = 0
         self._validation_rejections = 0
         self._nan_replacements = 0
+        self._skip_next_apply = False
+        self._skip_next_apply_requests = 0
+        self._policy_skip_count = 0
         
         logger.info(
             f"ContinuousWeightApplier initialized with interval={apply_interval}, "
@@ -79,6 +82,15 @@ class ContinuousWeightApplier:
         Returns:
             bool: True if weights were applied, False otherwise
         """
+        if self._skip_next_apply:
+            self._skip_next_apply = False
+            self._policy_skip_count += 1
+            logger.warning(
+                "Step %s: Skipping weight application due to fail-closed policy.",
+                global_step,
+            )
+            return False
+
         # Check if we should apply weights at this step
         if not self.should_apply(global_step):
             return False
@@ -133,6 +145,11 @@ class ContinuousWeightApplier:
         except Exception as e:
             logger.error(f"Error applying weights at step {global_step}: {e}")
             return False
+
+    def request_skip_next_apply(self) -> None:
+        """Request fail-closed suppression for the next application attempt."""
+        self._skip_next_apply = True
+        self._skip_next_apply_requests += 1
 
     def _validate_weights_for_application(
         self,
@@ -238,6 +255,8 @@ class ContinuousWeightApplier:
             'invalid_payload_skips': self._invalid_payload_skips,
             'validation_rejections': self._validation_rejections,
             'nan_replacements': self._nan_replacements,
+            'skip_next_apply_requests': self._skip_next_apply_requests,
+            'policy_skip_count': self._policy_skip_count,
         }
     
     def reset_metrics(self) -> None:
@@ -250,6 +269,9 @@ class ContinuousWeightApplier:
         self._invalid_payload_skips = 0
         self._validation_rejections = 0
         self._nan_replacements = 0
+        self._skip_next_apply = False
+        self._skip_next_apply_requests = 0
+        self._policy_skip_count = 0
         logger.debug("ContinuousWeightApplier metrics reset")
 
 

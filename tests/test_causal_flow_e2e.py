@@ -1,6 +1,7 @@
 """End-to-end tests for Phase 5 causal training integration."""
 
 import unittest
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -10,6 +11,8 @@ from src.finetuner.causal_engine import CausalMonteCLoRAEngine
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
 from src.settings.settings import CausalTrainingConfig
 from src.utils.causal_sampler import CausalWeightSampler
+from src.utils.async_sampler import BackgroundSampler
+from src.utils.multiprocessing import RingBuffer
 
 
 class TinyDataset(Dataset):
@@ -215,6 +218,63 @@ class TestCausalFlowE2E(unittest.TestCase):
         self.assertIsNotNone(orchestrator.async_sampler)
         self.assertIsNotNone(orchestrator.weight_applier)
         self.assertIsNotNone(orchestrator.budget_monitor)
+
+    def test_async_sampler_compatible_with_ring_buffer(self):
+        ring_buffer = RingBuffer(size=15)
+        sampler = BackgroundSampler(
+            buffer=ring_buffer,
+            model=self.model,
+            max_steps=2,
+            causal_sampler=self.causal_sampler,
+        )
+
+        sampler.start()
+
+        latest = None
+        deadline = time.time() + 3.0
+        while latest is None and time.time() < deadline:
+            latest = ring_buffer.get_latest()
+            if latest is None:
+                time.sleep(0.05)
+
+        sampler.stop()
+        sampler.raise_if_failed()
+        status = sampler.get_status()
+
+        self.assertIsNone(status["last_error"])
+        self.assertGreaterEqual(status["metrics"]["generated_batches"], 0)
+        if latest is not None:
+            self.assertIsInstance(latest, dict)
+
+    def test_fail_closed_mml_continues_training(self):
+        trainer = DummyTrainer(self.model, self.train_loader, self.eval_loader, max_steps=6)
+        config = CausalTrainingConfig(
+            total_causal_budget=100,
+            async_max_steps=3,
+            apply_interval=2,
+            device="cpu",
+        )
+
+        orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            trainer,
+            self.causal_sampler,
+            config,
+        )
+
+        orchestrator.prepare(self.model, self.train_loader)
+        orchestrator.causal_engine.validate_marginal_likelihood = lambda *args, **kwargs: None
+
+        result = orchestrator.run_training()
+        diagnostics = orchestrator.get_diagnostics()
+
+        self.assertIn("train_loss", result)
+        self.assertEqual(diagnostics["state"], orchestrator.COMPLETED)
+        self.assertGreaterEqual(
+            diagnostics["weight_application_metrics"].get("skip_next_apply_requests", 0),
+            1,
+        )
 
 
 if __name__ == "__main__":

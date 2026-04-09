@@ -570,3 +570,47 @@ class TestCausalTrainingConfigNewFields:
         assert cfg.total_causal_budget == 1000
         assert cfg.async_max_steps == 100
         assert cfg.apply_interval == 10
+
+    def test_proposed_causal_temperature_defaults(self):
+        cfg = CausalTrainingConfig()
+        assert cfg.causal_softmax_temp_init == pytest.approx(2.0)
+        assert cfg.causal_softmax_temp_final == pytest.approx(0.5)
+        assert cfg.causal_temp_annealing is True
+
+    def test_phase_temperature_initiation_transition_convergence(self):
+        cfg = CausalTrainingConfig(
+            causal_softmax_temp_init=2.0,
+            causal_softmax_temp_final=0.5,
+            causal_temp_annealing=True,
+            causal_temp_decay_strategy="linear",
+        )
+        # Initiation phase (<20%)
+        assert cfg.get_causal_temperature(0.1) == pytest.approx(2.0)
+        # Mid transition phase (20%-80%)
+        assert cfg.get_causal_temperature(0.5) == pytest.approx(1.25)
+        # Convergence phase (>80%)
+        assert cfg.get_causal_temperature(0.9) == pytest.approx(0.5)
+
+    def test_phase_temperature_cubic_decay(self):
+        cfg = CausalTrainingConfig(
+            causal_softmax_temp_init=2.0,
+            causal_softmax_temp_final=0.5,
+            causal_temp_annealing=True,
+            causal_temp_decay_strategy="cubic",
+        )
+        linear_equivalent = CausalTrainingConfig(
+            causal_softmax_temp_init=2.0,
+            causal_softmax_temp_final=0.5,
+            causal_temp_annealing=True,
+            causal_temp_decay_strategy="linear",
+        ).get_causal_temperature(0.5)
+        assert cfg.get_causal_temperature(0.5) > linear_equivalent
+
+    def test_phase_temperature_requires_final_lower_than_init_when_annealing(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="causal_softmax_temp_final"):
+            CausalTrainingConfig(
+                causal_softmax_temp_init=0.5,
+                causal_softmax_temp_final=1.0,
+                causal_temp_annealing=True,
+            )

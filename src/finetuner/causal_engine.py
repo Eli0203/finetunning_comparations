@@ -285,6 +285,7 @@ class CausalMonteCLoRAEngine:
         self.sample_budget = sample_budget
         self._budget_strategy = budget_strategy or EqualBudgetAllocationStrategy()
         self.causal_paths: List[str] = []
+        self.path_scores: Dict[str, float] = {}
         self.budget_allocation: Dict[str, int] = {}
         self._warmup_state: Dict[str, Any] = {
             'enabled': False,
@@ -407,6 +408,9 @@ class CausalMonteCLoRAEngine:
             for name, sensitivity in sorted(module_sensitivities, key=lambda item: item[1], reverse=True)[:10]:
                 logger.debug(f"  {name}: {sensitivity:.4f}")
 
+        # Keep latest sensitivity map as fallback allocation scores.
+        self.path_scores = {name: score for name, score in module_sensitivities}
+
         # Clean up gradients so training loop starts from scratch
         model.zero_grad()
 
@@ -464,9 +468,14 @@ class CausalMonteCLoRAEngine:
                 type(self._budget_strategy).__name__,
             )
 
-        if strategy_accepts_scores and scores is not None:
+        effective_scores = scores if scores is not None else (
+            {path: self.path_scores.get(path, 0.0) for path in causal_paths}
+            if self.path_scores else None
+        )
+
+        if strategy_accepts_scores and effective_scores is not None:
             allocation = self._budget_strategy.allocate(
-                causal_paths, total_budget, scores=scores
+                causal_paths, total_budget, scores=effective_scores
             )
         else:
             allocation = self._budget_strategy.allocate(causal_paths, total_budget)
@@ -505,6 +514,7 @@ class CausalMonteCLoRAEngine:
         """
         return {
             'causal_paths': self.causal_paths,
+            'path_scores': self.path_scores,
             'budget_allocation': self.budget_allocation,
             'total_budget': self.sample_budget,
             'causal_threshold': self.causal_threshold,
@@ -649,7 +659,7 @@ class CausalMonteCLoRAEngine:
         """Return warm-up diagnostics."""
         return self._warmup_state
 
-    def validate_marginal_likelihood(self, model: nn.Module, val_loader, device: str = 'cpu') -> float:
+    def validate_marginal_likelihood(self, model: nn.Module, val_loader, device: str = 'cpu') -> Optional[float]:
         """
         Estimate marginal likelihood using Laplace approximation utilities.
 
@@ -659,7 +669,7 @@ class CausalMonteCLoRAEngine:
             device: Evaluation device.
 
         Returns:
-            Estimated marginal likelihood value.
+            Estimated marginal likelihood value when finite; otherwise None.
         """
         model.eval()
         total_loss = 0.0
@@ -699,7 +709,15 @@ class CausalMonteCLoRAEngine:
         mml = float(LaplaceMath.model_evidence(log_likelihood, precision_diag_tensor, n_params))
 
         if torch.isnan(torch.tensor(mml)) or torch.isinf(torch.tensor(mml)):
-            logger.warning("Marginal likelihood is NaN/Inf; check data and warm-up stability.")
+            self._marginal_likelihood = None
+            logger.warning(
+                "Marginal likelihood is non-finite (mml=%s, batches=%d, n_params=%d); "
+                "fail-closed policy active, update application should be skipped.",
+                mml,
+                count,
+                n_params,
+            )
+            return None
 
         self._marginal_likelihood = mml
         logger.info(f"Estimated marginal likelihood: {mml:.6f}")

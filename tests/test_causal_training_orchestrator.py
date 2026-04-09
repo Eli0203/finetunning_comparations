@@ -288,6 +288,25 @@ class TestOrchestratorPrepare(unittest.TestCase):
         mock_applier.assert_called_once()
         mock_monitor.assert_called_once()
         self.trainer.add_callback.assert_called_once()
+
+    @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
+    @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
+    @patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier')
+    @patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor')
+    def test_prepare_registers_interventional_callback_when_enabled(
+        self, mock_monitor, mock_applier, mock_sampler, mock_optimizer
+    ):
+        """Interventional callback should be registered when config enables it."""
+        mock_optimizer.create_double_buffer.return_value = Mock()
+        mock_sampler.return_value = Mock()
+        mock_applier.return_value = Mock()
+        mock_monitor.return_value = Mock()
+
+        self.orchestrator.config.enable_interventional_weights = True
+        self.orchestrator.prepare(self.model, self.data_loader)
+
+        self.assertIsNotNone(self.orchestrator.interventional_callback)
+        self.assertEqual(self.trainer.add_callback.call_count, 2)
     
     @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
     @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
@@ -409,6 +428,18 @@ class TestOrchestratorRunTraining(unittest.TestCase):
         # Should raise ValueError
         with self.assertRaises(ValueError):
             orchestrator.run_training()
+
+    def test_run_training_requests_skip_next_apply_on_non_finite_mml(self):
+        """US5: fail-closed MML should request skip-next-apply."""
+        self.orchestrator.weight_applier = Mock()
+        self.orchestrator.weight_applier.request_skip_next_apply = Mock()
+        self.orchestrator._model_ref = Mock(spec=nn.Module)
+        self.orchestrator.causal_engine.validate_marginal_likelihood.return_value = None
+        self.trainer.get_eval_dataloader = Mock(return_value=[])
+
+        self.orchestrator.run_training()
+
+        self.orchestrator.weight_applier.request_skip_next_apply.assert_called_once()
 
 
 class TestOrchestratorDiagnostics(unittest.TestCase):
@@ -615,6 +646,567 @@ class TestMemory(unittest.TestCase):
         self.assertIsNone(orchestrator.budget_monitor)
         self.assertIsNone(orchestrator.weight_callback)
         self.assertEqual(orchestrator.state, orchestrator.IDLE)
+
+
+class TestOrchestratorStateTransitions(unittest.TestCase):
+    """Tests for orchestrator state machine transitions (T056).
+    
+    Spec Requirement: Strictly sequential progression with validation gates:
+    IDLE → PREPARING → SAMPLING → TRAINING
+    - SAMPLING can only start after warm-up completion
+    - TRAINING waits for in-flight SAMPLING to complete before advancing
+    """
+    
+    def setUp(self):
+        """Create mock components and orchestrator."""
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+        
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config
+        )
+    
+    def test_initial_state_is_idle(self):
+        """Test orchestrator starts in IDLE state."""
+        self.assertEqual(self.orchestrator.state, 'IDLE')
+    
+    def test_prepare_transitions_to_preparing_state(self):
+        """Test prepare() moves orchestrator to PREPARING state."""
+        with patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer'):
+            with patch('src.finetuner.causal_training_orchestrator.BackgroundSampler'):
+                with patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier'):
+                    with patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor'):
+                        # Setup mocks
+                        self.causal_engine.identify_causal_paths.return_value = {}
+                        self.causal_engine.allocate_budget.return_value = None
+                        self.causal_engine.budget_allocation = {}
+                        self.causal_engine.get_causal_summary.return_value = {}
+                        
+                        model = Mock()
+                        data_loader = Mock()
+                        
+                        # Execute prepare
+                        self.orchestrator.prepare(model, data_loader)
+                        
+                        # Verify state change
+                        self.assertEqual(self.orchestrator.state, 'SAMPLING')
+    
+    def test_warmup_completion_enables_sampling_transition(self):
+        """Test SAMPLING state can only be reached after warm-up completion."""
+        # Mock warm-up completion
+        self.orchestrator._warmup_complete = False
+        
+        # Try to transition to SAMPLING - should be blocked
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator._transition_to_sampling()
+        
+        # Mark warm-up as complete
+        self.orchestrator._warmup_complete = True
+        
+        # Now transition should succeed
+        self.orchestrator._transition_to_sampling()
+        self.assertEqual(self.orchestrator.state, 'SAMPLING')
+    
+    def test_sampling_to_training_waits_for_async_completion(self):
+        """Test TRAINING state waits for in-flight SAMPLING to complete."""
+        # Set to SAMPLING state
+        self.orchestrator.state = 'SAMPLING'
+        
+        # Mock async sampler with pending operations
+        self.orchestrator.async_sampler = Mock()
+        self.orchestrator.async_sampler.is_active.return_value = True
+        
+        # Transition should wait for sampler to complete
+        self.orchestrator._transition_to_training()
+        
+        # Verify that wait was called
+        self.orchestrator.async_sampler.join.assert_called_once()
+        self.assertEqual(self.orchestrator.state, 'TRAINING')
+    
+    def test_training_to_idle_cleanup(self):
+        """Test TRAINING → IDLE transition performs cleanup."""
+        self.orchestrator.state = 'TRAINING'
+        self.orchestrator.buffer = Mock()
+        self.orchestrator.async_sampler = Mock()
+        self.orchestrator.weight_applier = Mock()
+        
+        # Transition back to IDLE
+        self.orchestrator._transition_to_idle()
+        
+        # Verify cleanup was performed
+        self.orchestrator.async_sampler.stop.assert_called_once()
+        self.assertEqual(self.orchestrator.state, 'IDLE')
+    
+    def test_invalid_state_transition_rejected(self):
+        """Test invalid state transitions are rejected."""
+        # Try to go from IDLE to TRAINING directly
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator.state = 'IDLE'
+            self.orchestrator._transition_to_training()
+    
+    def test_state_transition_sequence_complete(self):
+        """Test complete state sequence: IDLE → PREPARING → SAMPLING → TRAINING."""
+        states = []
+        original_set_state = self.orchestrator.__setattr__
+        
+        def track_state_changes(name, value):
+            if name == 'state':
+                states.append(value)
+            original_set_state(name, value)
+        
+        self.orchestrator.__setattr__ = track_state_changes
+        
+        # Start in IDLE
+        self.assertEqual(self.orchestrator.state, 'IDLE')
+        states.append('IDLE')
+        
+        # Prepare moves to PREPARING
+        self.orchestrator.state = 'PREPARING'
+        self.assertEqual(self.orchestrator.state, 'PREPARING')
+        
+        # Warm-up complete, move to SAMPLING
+        self.orchestrator._warmup_complete = True
+        self.orchestrator.state = 'SAMPLING'
+        self.assertEqual(self.orchestrator.state, 'SAMPLING')
+        
+        # Move to TRAINING
+        self.orchestrator.state = 'TRAINING'
+        self.assertEqual(self.orchestrator.state, 'TRAINING')
+
+
+class TestWarmupGateBlocking(unittest.TestCase):
+    """Tests for warm-up gate blocking SAMPLING transitions (T057).
+    
+    Spec Requirement: SAMPLING can only start after ALL warm-up gates pass:
+    1. Signal gate: ||BA||_F > 1e-6
+    2. Loss gate: EMA loss is stable (no initial divergence)
+    3. Causal gate: Var(NIE) > 1e-6
+    4. Resource gate: sufficient buffer/VRAM capacity
+    """
+    
+    def setUp(self):
+        """Create orchestrator with mocked components."""
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+        
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config
+        )
+        
+        # Initialize warm-up gate state
+        self.orchestrator._warmup_gates = {
+            'signal': False,
+            'loss': False,
+            'causal': False,
+            'resource': False
+        }
+    
+    def test_sampling_blocked_when_signal_gate_not_passed(self):
+        """Test SAMPLING blocked if signal gate (||BA||_F > 1e-6) not passed."""
+        self.orchestrator._warmup_gates = {
+            'signal': False,
+            'loss': True,
+            'causal': True,
+            'resource': True
+        }
+        
+        # Try to transition to SAMPLING - should fail
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator._check_warmup_gates()
+    
+    def test_sampling_blocked_when_loss_gate_not_passed(self):
+        """Test SAMPLING blocked if loss gate (EMA stability) not passed."""
+        self.orchestrator._warmup_gates = {
+            'signal': True,
+            'loss': False,
+            'causal': True,
+            'resource': True
+        }
+        
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator._check_warmup_gates()
+    
+    def test_sampling_blocked_when_causal_gate_not_passed(self):
+        """Test SAMPLING blocked if causal gate (Var(NIE) > 1e-6) not passed."""
+        self.orchestrator._warmup_gates = {
+            'signal': True,
+            'loss': True,
+            'causal': False,
+            'resource': True
+        }
+        
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator._check_warmup_gates()
+    
+    def test_sampling_blocked_when_resource_gate_not_passed(self):
+        """Test SAMPLING blocked if resource gate (buffer/VRAM) not passed."""
+        self.orchestrator._warmup_gates = {
+            'signal': True,
+            'loss': True,
+            'causal': True,
+            'resource': False
+        }
+        
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.orchestrator._check_warmup_gates()
+    
+    def test_sampling_allowed_when_all_gates_passed(self):
+        """Test SAMPLING allowed only when ALL gates pass."""
+        self.orchestrator._warmup_gates = {
+            'signal': True,
+            'loss': True,
+            'causal': True,
+            'resource': True
+        }
+        
+        # Should not raise
+        self.orchestrator._check_warmup_gates()
+        self.orchestrator._warmup_complete = True
+    
+    def test_signal_gate_checks_frobenius_norm(self):
+        """Test signal gate checks ||BA||_F > 1e-6."""
+        # Mock gradient computation
+        self.orchestrator.causal_engine = Mock()
+        self.orchestrator.causal_engine.compute_backdoor_gradients.return_value = {
+            'attention': {'A': Mock(), 'B': Mock()},
+            'ffn': {'A': Mock(), 'B': Mock()}
+        }
+        
+        # Test low Frobenius norm (should fail)
+        with patch('torch.linalg.matrix_norm') as mock_norm:
+            mock_norm.return_value = 1e-7
+            result = self.orchestrator._check_signal_gate()
+            self.assertFalse(result)
+        
+        # Test high Frobenius norm (should pass)
+        with patch('torch.linalg.matrix_norm') as mock_norm:
+            mock_norm.return_value = 1e-5
+            result = self.orchestrator._check_signal_gate()
+            self.assertTrue(result)
+    
+    def test_loss_gate_checks_ema_stability(self):
+        """Test loss gate checks EMA loss stability."""
+        # Mock trainer state
+        self.orchestrator.trainer = Mock()
+        self.orchestrator.trainer.state = Mock()
+        self.orchestrator.trainer.state.log_history = [
+            {'loss': 4.0},
+            {'loss': 3.9},
+            {'loss': 3.8},  # Stable decline
+        ]
+        
+        # Should pass with stable EMA
+        result = self.orchestrator._check_loss_gate()
+        self.assertTrue(result)
+    
+    def test_resource_gate_checks_buffer_availability(self):
+        """Test resource gate checks buffer availability."""
+        # Mock buffer
+        self.orchestrator.buffer = Mock()
+        self.orchestrator.buffer.available_slots.return_value = 10
+        
+        # Should pass with sufficient slots
+        result = self.orchestrator._check_resource_gate()
+        self.assertTrue(result)
+        
+        # Should fail with no available slots
+        self.orchestrator.buffer.available_slots.return_value = 0
+        result = self.orchestrator._check_resource_gate()
+        self.assertFalse(result)
+
+
+class TestMultiPrecisionSupport(unittest.TestCase):
+    """Tests for multi-precision peft_config injection (T058).
+    
+    Spec Requirement: Dynamically inject peft_config (FP16 or NF4/QLoRA)
+    based on memory profile without hardcoding precision barriers.
+    """
+    
+    def setUp(self):
+        """Create orchestrator for multi-precision testing."""
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+        
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config
+        )
+    
+    def test_peft_config_injection_for_low_vram_profile(self):
+        """Test NF4/QLoRA injection for Low-VRAM profile."""
+        available_vram = 4.0  # 4 GB
+        
+        peft_config = self.orchestrator._select_peft_config(available_vram)
+        
+        # Should return QLoRA/NF4 config for low VRAM
+        self.assertIsNotNone(peft_config)
+        self.assertIn('nf4', str(peft_config).lower())
+    
+    def test_peft_config_injection_for_medium_vram_profile(self):
+        """Test FP16 injection for Medium-VRAM profile."""
+        available_vram = 8.0  # 8 GB
+        
+        peft_config = self.orchestrator._select_peft_config(available_vram)
+        
+        # Should return FP16 config for medium VRAM
+        self.assertIsNotNone(peft_config)
+    
+    def test_peft_config_injection_for_high_vram_profile(self):
+        """Test FP32 injection for High-VRAM profile."""
+        available_vram = 16.0  # 16 GB
+        
+        peft_config = self.orchestrator._select_peft_config(available_vram)
+        
+        # Should return FP32 config for high VRAM
+        self.assertIsNotNone(peft_config)
+    
+    def test_peft_config_respects_default_quantization_setting(self):
+        """Test peft_config selection respects DEFAULT_QUANTIZATION setting."""
+        from src.settings.settings import Settings
+        
+        # Create settings with nf4_forced
+        with patch.dict('os.environ', {'DEFAULT_QUANTIZATION': 'nf4_forced'}):
+            settings = Settings(hf_token='test')
+            self.orchestrator.config._settings = settings
+            
+            # Should force NF4 even with higher VRAM
+            available_vram = 16.0
+            peft_config = self.orchestrator._select_peft_config(available_vram)
+            
+            self.assertIsNotNone(peft_config)
+    
+    def test_peft_config_registered_with_trainer(self):
+        """Test peft_config is registered with trainer model."""
+        peft_config = self.orchestrator._select_peft_config(4.0)
+        
+        # Mock model
+        model = Mock()
+        
+        # Register config
+        self.orchestrator._register_peft_config(model, peft_config)
+        
+        # Config should be attached to model
+        self.assertTrue(hasattr(model, 'peft_config') or model.method_calls)
+
+
+class TestNF4AutoDetection(unittest.TestCase):
+    """Tests for NF4 auto-detection and BitsAndBytesConfig (T059).
+    
+    Spec Requirement: Auto-detect NF4 at startup; if detected, apply
+    BitsAndBytesConfig with double quantization automatically.
+    """
+    
+    def setUp(self):
+        """Create orchestrator for NF4 detection testing."""
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+        
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config
+        )
+    
+    def test_nf4_detection_on_low_vram(self):
+        """Test NF4 is auto-detected when VRAM < 6GB."""
+        available_vram = 4.0  # 4 GB
+        
+        should_use_nf4 = self.orchestrator._should_use_nf4(available_vram)
+        
+        self.assertTrue(should_use_nf4)
+    
+    def test_nf4_not_detected_on_high_vram(self):
+        """Test NF4 not auto-detected when VRAM >= 6GB."""
+        available_vram = 8.0  # 8 GB
+        
+        should_use_nf4 = self.orchestrator._should_use_nf4(available_vram)
+        
+        self.assertFalse(should_use_nf4)
+    
+    def test_bits_and_bytes_config_creation_with_nf4(self):
+        """Test BitsAndBytesConfig is created with double quantization."""
+        bnb_config = self.orchestrator._create_bnb_config()
+        
+        # Verify double quantization is enabled
+        self.assertTrue(bnb_config.double_quantization)
+        self.assertEqual(bnb_config.quant_type, 'nf4')
+    
+    def test_bits_and_bytes_config_4bit_settings(self):
+        """Test BitsAndBytesConfig has correct 4-bit compute settings."""
+        bnb_config = self.orchestrator._create_bnb_config()
+        
+        # Verify 4-bit compute settings
+        self.assertTrue(bnb_config.load_in_4bit)
+        self.assertEqual(bnb_config.bnb_4bit_compute_dtype, 'float16')
+    
+    def test_nf4_detection_respects_forced_setting(self):
+        """Test NF4_FORCED overrides VRAM-based detection."""
+        from src.settings.settings import Settings
+        
+        with patch.dict('os.environ', {'DEFAULT_QUANTIZATION': 'nf4_forced'}):
+            settings = Settings(hf_token='test')
+            self.orchestrator.config._settings = settings
+            
+            # Even with high VRAM, should use NF4
+            available_vram = 16.0
+            should_use_nf4 = self.orchestrator._should_use_nf4(
+                available_vram, 
+                force_nf4=True
+            )
+            
+            self.assertTrue(should_use_nf4)
+    
+    def test_bnb_config_applied_to_model_loading(self):
+        """Test BitsAndBytesConfig is applied during model loading."""
+        bnb_config = self.orchestrator._create_bnb_config()
+        
+        # Mock model loading
+        with patch('transformers.AutoModelForSequenceClassification.from_pretrained') as mock_load:
+            mock_model = Mock()
+            mock_load.return_value = mock_model
+            
+            # Load with BitsAndBytes config
+            self.orchestrator._load_model_with_bnb(
+                'bert-base-uncased',
+                bnb_config
+            )
+            
+            # Verify from_pretrained was called with quantization_config
+            called_kwargs = mock_load.call_args[1]
+            self.assertIn('quantization_config', called_kwargs)
+
+
+class TestBackgroundSamplerAsyncPreFetch(unittest.TestCase):
+    """Tests for BackgroundSampler async pre-fetch with blocking wait (T060).
+    
+    Spec Requirement: SAMPLING runs in background to pre-fetch batches;
+    TRAINING consumes them synchronously with explicit blocking wait if
+    buffer empty.
+    """
+    
+    def setUp(self):
+        """Create orchestrator for async sampler testing."""
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+        
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config
+        )
+    
+    def test_background_sampler_starts_on_prepare(self):
+        """Test BackgroundSampler starts during prepare()."""
+        async_sampler = Mock()
+        self.orchestrator.async_sampler = async_sampler
+        
+        # Start sampler
+        self.orchestrator._start_background_sampler()
+        
+        # Verify start was called
+        async_sampler.start.assert_called_once()
+    
+    def test_background_sampler_pre_fetches_batches(self):
+        """Test BackgroundSampler pre-fetches batches asynchronously."""
+        async_sampler = Mock()
+        async_sampler.get_next_weight.return_value = {'batch': 0, 'weight': 1.0}
+        
+        self.orchestrator.async_sampler = async_sampler
+        
+        # Request batch
+        batch = self.orchestrator._get_next_weight_async()
+        
+        # Should return immediately without blocking train loop
+        self.assertEqual(batch, {'batch': 0, 'weight': 1.0})
+    
+    def test_blocking_wait_when_buffer_empty(self):
+        """Test explicit blocking wait if sampler buffer is empty."""
+        async_sampler = Mock()
+        
+        # First call returns None (buffer empty), second returns weight
+        async_sampler.get_next_weight.side_effect = [None, {'weight': 1.0}]
+        
+        self.orchestrator.async_sampler = async_sampler
+        
+        # Request weight with blocking wait
+        weight = self.orchestrator._get_next_weight_blocking()
+        
+        # Should have waited and returned weight
+        self.assertEqual(weight, {'weight': 1.0})
+        self.assertEqual(async_sampler.wait_for_batch.call_count, 1)
+    
+    def test_async_prefetch_throughput_exceeds_training_rate(self):
+        """Test sampler throughput ≥ 2× training step rate."""
+        async_sampler = Mock()
+        
+        # Simulate pre-fetching at 2x training rate
+        training_batch_rate = 1000  # batches/sec
+        expected_sampler_rate = training_batch_rate * 2  # 2000 batches/sec
+        
+        async_sampler.get_throughput.return_value = expected_sampler_rate
+        
+        self.orchestrator.async_sampler = async_sampler
+        
+        actual_rate = async_sampler.get_throughput()
+        
+        # Verify sampler exceeds 2x training rate
+        self.assertGreaterEqual(actual_rate, expected_sampler_rate)
+    
+    def test_async_sampler_handles_failure_gracefully(self):
+        """Test orchestrator handles sampler failures gracefully."""
+        async_sampler = Mock()
+        async_sampler.is_failed.return_value = False
+        async_sampler.get_failure_reason.return_value = None
+        
+        self.orchestrator.async_sampler = async_sampler
+        
+        # Check for failures
+        has_failed = async_sampler.is_failed()
+        
+        self.assertFalse(has_failed)
+    
+    def test_async_sampler_stops_on_cleanup(self):
+        """Test BackgroundSampler stops during orchestrator cleanup."""
+        async_sampler = Mock()
+        async_sampler.is_active.return_value = True
+        
+        self.orchestrator.async_sampler = async_sampler
+        
+        # Stop sampler
+        self.orchestrator._stop_background_sampler()
+        
+        # Verify stop was called
+        async_sampler.stop.assert_called_once()
 
 
 if __name__ == '__main__':

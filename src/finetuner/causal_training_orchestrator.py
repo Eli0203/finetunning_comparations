@@ -12,9 +12,14 @@ Single Responsibility: This class coordinates all components but implements
 NO core logic itself. All actual work is delegated to specialized components.
 """
 
+import os
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Optional
+
+import torch
 import torch.nn as nn
-from typing import Any, Callable, Dict, Optional
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from src.utils.math_utils import CausalMath
 from src.utils.logger import logger
 from src.utils.causal_sampler import CausalWeightSampler
 from src.utils.async_sampler import BackgroundSampler
@@ -98,6 +103,86 @@ class WeightApplicationCallback(TrainerCallback):
         }
 
 
+class InterventionalWeightCallback(TrainerCallback):
+    """Compute bounded interventional weights from a rolling empirical window."""
+
+    def __init__(self, window_size: int = 50, max_weight: float = 10.0) -> None:
+        if window_size <= 0:
+            raise ValueError("window_size must be greater than 0")
+        if max_weight <= 0:
+            raise ValueError("max_weight must be greater than 0")
+
+        self.window_size = window_size
+        self.max_weight = max_weight
+        self._feature_window: Deque[int] = deque()
+        self._freq_table: Dict[int, int] = {}
+        self.applied_steps = 0
+        self.last_mean_weight = 0.0
+
+    def _hash_feature(self, input_ids: torch.Tensor) -> int:
+        flat_values = tuple(int(value) for value in input_ids.detach().cpu().reshape(-1).tolist())
+        return hash(flat_values)
+
+    def _push_feature(self, feature_hash: int) -> None:
+        if len(self._feature_window) >= self.window_size:
+            evicted = self._feature_window.popleft()
+            remaining = self._freq_table[evicted] - 1
+            if remaining <= 0:
+                del self._freq_table[evicted]
+            else:
+                self._freq_table[evicted] = remaining
+
+        self._feature_window.append(feature_hash)
+        self._freq_table[feature_hash] = self._freq_table.get(feature_hash, 0) + 1
+
+    def on_step_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: Any,
+    ) -> TrainerControl:
+        del args, state
+
+        inputs = kwargs.get('inputs')
+        if not isinstance(inputs, dict):
+            return control
+
+        input_ids = inputs.get('input_ids')
+        if not isinstance(input_ids, torch.Tensor) or input_ids.ndim == 0:
+            return control
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        feature_hashes = [self._hash_feature(sample) for sample in input_ids]
+        for feature_hash in feature_hashes:
+            self._push_feature(feature_hash)
+
+        total = max(len(self._feature_window), 1)
+        probabilities = torch.tensor(
+            [self._freq_table[feature_hash] / total for feature_hash in feature_hashes],
+            dtype=torch.float32,
+        )
+        p_z = torch.ones(2, dtype=torch.float32) / 2.0
+        p_y_given_x_z = probabilities.unsqueeze(-1).repeat(1, 2)
+        adjusted = CausalMath.backdoor_adjustment(p_y_given_x_z, p_z).clamp(min=1e-12)
+        weights = (1.0 / adjusted).clamp(max=self.max_weight).to(dtype=torch.float32)
+
+        inputs['interventional_weights'] = weights
+        self.applied_steps += 1
+        self.last_mean_weight = float(weights.mean().item()) if weights.numel() else 0.0
+        return control
+
+    def get_metrics(self) -> Dict[str, Any]:
+        return {
+            'applied_steps': self.applied_steps,
+            'window_size': self.window_size,
+            'tracked_features': len(self._freq_table),
+            'last_mean_weight': self.last_mean_weight,
+        }
+
+
 class CausalTrainingOrchestrator:
     """
     Orchestrator for end-to-end causal training with continuous weight application.
@@ -162,17 +247,205 @@ class CausalTrainingOrchestrator:
         self.weight_applier: Optional[ContinuousWeightApplier] = None
         self.budget_monitor: Optional[TrainingBudgetMonitor] = None
         self.weight_callback: Optional[WeightApplicationCallback] = None
+        self.interventional_callback: Optional[InterventionalWeightCallback] = None
         self._model_ref: Optional[nn.Module] = None
         self._train_loader_ref: Optional[Any] = None
         
         # State tracking
         self._state = self.IDLE
+        # Warm-up gate tracking (Phase 6)
+        self._warmup_complete = False
+        self._warmup_gates = {
+            'signal': False,
+            'loss': False,
+            'causal': False,
+            'resource': False,
+        }
         logger.info("CausalTrainingOrchestrator initialized in IDLE state")
     
     @property
     def state(self) -> str:
         """Return current orchestrator state."""
         return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        """Allow tests/runtime to set state through a validated setter."""
+        valid_states = {
+            self.IDLE,
+            self.PREPARING,
+            self.SAMPLING,
+            self.TRAINING,
+            self.COMPLETED,
+            self.FAILED,
+        }
+        if value not in valid_states:
+            raise ValueError(f"Invalid state: {value}")
+        self._state = value
+
+    def _transition_to_sampling(self) -> None:
+        """Transition PREPARING -> SAMPLING only after warm-up completion."""
+        if self._state not in {self.PREPARING, self.IDLE}:
+            raise ValueError(f"Invalid transition to SAMPLING from {self._state}")
+        if not self._warmup_complete:
+            raise RuntimeError("Cannot transition to SAMPLING before warm-up completion")
+        self._state = self.SAMPLING
+
+    def _transition_to_training(self) -> None:
+        """Transition SAMPLING -> TRAINING, waiting for in-flight sampler work."""
+        if self._state != self.SAMPLING:
+            raise ValueError(f"Invalid transition to TRAINING from {self._state}")
+        if self.async_sampler is not None and hasattr(self.async_sampler, 'join'):
+            self.async_sampler.join()
+        self._state = self.TRAINING
+
+    def _transition_to_idle(self) -> None:
+        """Transition TRAINING/COMPLETED/FAILED -> IDLE with sampler cleanup."""
+        if self.async_sampler is not None and hasattr(self.async_sampler, 'stop'):
+            self.async_sampler.stop()
+        self._state = self.IDLE
+
+    def _check_warmup_gates(self) -> None:
+        """Validate all warm-up gates; raise if any gate is false."""
+        failed = [name for name, passed in self._warmup_gates.items() if not passed]
+        if failed:
+            raise RuntimeError(f"Warm-up gates not satisfied: {failed}")
+        self._warmup_complete = True
+
+    def _check_signal_gate(self) -> bool:
+        """Signal gate: ||BA||_F > 1e-6."""
+        try:
+            grads = self.causal_engine.compute_backdoor_gradients()
+            if not grads:
+                return False
+            max_norm = 0.0
+            for matrices in grads.values():
+                if isinstance(matrices, dict) and 'A' in matrices and 'B' in matrices:
+                    norm = torch.linalg.matrix_norm(matrices['A'])
+                    max_norm = max(max_norm, float(norm))
+            return max_norm > 1e-6
+        except Exception:
+            return False
+
+    def _check_loss_gate(self) -> bool:
+        """Loss gate: recent loss trend should not diverge."""
+        try:
+            history = getattr(getattr(self.trainer, 'state', None), 'log_history', [])
+            losses = [entry.get('loss') for entry in history if isinstance(entry, dict) and 'loss' in entry]
+            if len(losses) < 3:
+                return True
+            recent = losses[-3:]
+            return recent[2] <= recent[0]
+        except Exception:
+            return False
+
+    def _check_causal_gate(self) -> bool:
+        """Causal gate: Var(NIE) > 1e-6."""
+        try:
+            summary = self.causal_engine.get_causal_summary()
+            nie_var = float(summary.get('nie_variance', 0.0)) if isinstance(summary, dict) else 0.0
+            return nie_var > 1e-6
+        except Exception:
+            return False
+
+    def _check_resource_gate(self) -> bool:
+        """Resource gate: buffer slots available and RAM under configured ceiling."""
+        if self.buffer is None or not hasattr(self.buffer, 'available_slots'):
+            return False
+        if self.buffer.available_slots() <= 0:
+            return False
+
+        max_ram = getattr(self.config, 'max_ram_threshold_gb', 9.0)
+        if max_ram is None:
+            max_ram = 9.0
+        try:
+            import psutil
+
+            current_ram = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+            return current_ram < float(max_ram)
+        except Exception:
+            return True
+
+    def _select_peft_config(self, available_vram_gb: float) -> Dict[str, Any]:
+        """Select precision/quantization profile from memory and defaults."""
+        settings_obj = getattr(self.config, '_settings', None)
+        default_quant = getattr(settings_obj, 'default_quantization', 'auto')
+
+        if default_quant == 'nf4_forced':
+            return {'precision': 'nf4', 'quantization': 'nf4'}
+        if default_quant == 'fp16':
+            return {'precision': 'fp16', 'quantization': 'none'}
+        if available_vram_gb < 6.0:
+            return {'precision': 'nf4', 'quantization': 'nf4'}
+        if available_vram_gb < 12.0:
+            return {'precision': 'fp16', 'quantization': 'none'}
+        return {'precision': 'fp32', 'quantization': 'none'}
+
+    def _register_peft_config(self, model: Any, peft_config: Dict[str, Any]) -> None:
+        """Attach peft configuration to the model object for later consumption."""
+        setattr(model, 'peft_config', peft_config)
+
+    def _should_use_nf4(self, available_vram_gb: float, force_nf4: bool = False) -> bool:
+        """NF4 selection logic for Low-VRAM and explicit force mode."""
+        if force_nf4:
+            return True
+        settings_obj = getattr(self.config, '_settings', None)
+        default_quant = getattr(settings_obj, 'default_quantization', 'auto')
+        if default_quant == 'nf4_forced':
+            return True
+        if default_quant == 'fp16':
+            return False
+        return available_vram_gb < 6.0
+
+    def _create_bnb_config(self) -> Any:
+        """Build a lightweight BitsAndBytes-style config object used by tests/runtime."""
+        class _BnbConfig:
+            def __init__(self) -> None:
+                self.load_in_4bit = True
+                self.bnb_4bit_compute_dtype = 'float16'
+                self.double_quantization = True
+                self.quant_type = 'nf4'
+
+        return _BnbConfig()
+
+    def _load_model_with_bnb(self, model_name: str, bnb_config: Any) -> Any:
+        """Load HF model using quantization config."""
+        from transformers import AutoModelForSequenceClassification
+
+        return AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+        )
+
+    def _start_background_sampler(self) -> None:
+        """Start async sampler process if available."""
+        if self.async_sampler is not None and hasattr(self.async_sampler, 'start'):
+            self.async_sampler.start()
+
+    def _stop_background_sampler(self) -> None:
+        """Stop async sampler process if available."""
+        if self.async_sampler is not None and hasattr(self.async_sampler, 'stop'):
+            self.async_sampler.stop()
+
+    def _get_next_weight_async(self) -> Optional[Dict[str, Any]]:
+        """Try non-blocking retrieval from async sampler."""
+        if self.async_sampler is None or not hasattr(self.async_sampler, 'get_next_weight'):
+            return None
+        return self.async_sampler.get_next_weight()
+
+    def _get_next_weight_blocking(self) -> Dict[str, Any]:
+        """Blocking retrieval when async buffer is empty."""
+        if self.async_sampler is None or not hasattr(self.async_sampler, 'get_next_weight'):
+            raise RuntimeError("Async sampler is not available")
+        candidate = self.async_sampler.get_next_weight()
+        if candidate is not None:
+            return candidate
+        if hasattr(self.async_sampler, 'wait_for_batch'):
+            self.async_sampler.wait_for_batch()
+        candidate = self.async_sampler.get_next_weight()
+        if candidate is None:
+            raise RuntimeError("No async weight available after blocking wait")
+        return candidate
     
     def prepare(self, model: nn.Module, data_loader: Any) -> None:
         """
@@ -279,6 +552,9 @@ class CausalTrainingOrchestrator:
                 sampler_health_check=self.async_sampler.raise_if_failed,
             )
             self.trainer.add_callback(self.weight_callback)
+            if getattr(self.config, 'enable_interventional_weights', False):
+                self.interventional_callback = InterventionalWeightCallback()
+                self.trainer.add_callback(self.interventional_callback)
             logger.info("[7/7] [OK] Callback registered")
             
             # Update state
@@ -344,11 +620,17 @@ class CausalTrainingOrchestrator:
             try:
                 if hasattr(self.trainer, 'get_eval_dataloader'):
                     eval_loader = self.trainer.get_eval_dataloader()
-                    self.causal_engine.validate_marginal_likelihood(
+                    mml = self.causal_engine.validate_marginal_likelihood(
                         self._model_ref,
                         eval_loader,
                         device=self.config.device,
                     )
+                    if mml is None and self.weight_applier is not None:
+                        self.weight_applier.request_skip_next_apply()
+                        logger.warning(
+                            "Fail-closed marginal likelihood path activated; "
+                            "next weight application will be skipped."
+                        )
             except Exception as eval_exc:
                 logger.error(
                     f"Marginal likelihood validation failed: {eval_exc}. Continuing."

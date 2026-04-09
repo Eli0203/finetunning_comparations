@@ -7,8 +7,9 @@ author: Eliana Vallejo
 import psutil
 import torch
 import gc
+from typing import Any
 from src.utils.logger import logger
-from src.utils.multiprocessing import DoubleBuffer
+from src.utils.multiprocessing import RingBuffer
 
 
 class MemoryOptimizer:
@@ -37,14 +38,19 @@ class MemoryOptimizer:
 
     @staticmethod
     def create_double_buffer():
-        """Create a cross-process double buffer for async sampling.
+        """Create a cross-process ring buffer for async sampling.
 
         Returns:
-            DoubleBuffer: Provides O(1) retrieval of the latest item.
+            RingBuffer: Provides O(1) retrieval of the latest item.
         """
-        return DoubleBuffer()
+        return RingBuffer(size=15)
 
     @staticmethod
-    def try_get_latest(buffer: DoubleBuffer):
-        """Attempt to read the latest item from a DoubleBuffer without blocking."""
+    def create_ring_buffer(size: int = 15) -> RingBuffer:
+        """Create a configurable ring buffer for async sampling."""
+        return RingBuffer(size=size)
+
+    @staticmethod
+    def try_get_latest(buffer: Any):
+        """Attempt to read the latest item from a DoubleBuffer/RingBuffer."""
         return buffer.get_latest()
