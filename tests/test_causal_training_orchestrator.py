@@ -23,7 +23,7 @@ from src.finetuner.causal_training_orchestrator import (
     CausalTrainingOrchestrator,
     WeightApplicationCallback
 )
-from src.settings.settings import CausalTrainingConfig
+from src.settings import CausalTrainingConfig
 
 
 class TestCausalTrainingConfig(unittest.TestCase):
@@ -352,6 +352,78 @@ class TestOrchestratorPrepare(unittest.TestCase):
                 self.orchestrator.prepare(self.model, self.data_loader)
 
 
+class TestUS3FailingFirstPrepareBudget(unittest.TestCase):
+    """Failing-first tests for Phase 5 US3 (T065-T067)."""
+
+    def setUp(self):
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+
+        self.model = Mock(spec=nn.Module)
+        self.data_loader = Mock()
+
+        self.causal_engine.identify_causal_paths.return_value = {
+            'attention': True,
+            'ffn': True,
+        }
+        self.causal_engine.allocate_budget.return_value = None
+        self.causal_engine.budget_allocation = {'attention': 500, 'ffn': 500}
+        self.causal_engine.get_causal_summary.return_value = {'summary': 'test'}
+
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config,
+        )
+
+    def test_register_callbacks_blocked_when_prepare_not_called(self):
+        """T065: callback registration must fail-fast before prepare()."""
+        with self.assertRaises(RuntimeError):
+            self.orchestrator.register_callbacks()
+
+    @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
+    @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
+    @patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier')
+    @patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor')
+    def test_prepare_sets_is_prepared_true(
+        self, mock_monitor, mock_applier, mock_sampler, mock_optimizer
+    ):
+        """T066: prepare() must expose readiness via is_prepared=true."""
+        mock_optimizer.create_double_buffer.return_value = Mock()
+        mock_sampler.return_value = Mock()
+        mock_applier.return_value = Mock()
+        mock_monitor.return_value = Mock()
+
+        self.orchestrator.prepare(self.model, self.data_loader)
+
+        self.assertTrue(self.orchestrator.is_prepared)
+
+    @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
+    @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
+    @patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier')
+    @patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor')
+    def test_budget_allocation_populated_post_prepare(
+        self, mock_monitor, mock_applier, mock_sampler, mock_optimizer
+    ):
+        """T067: prepare() must populate orchestrator-level budget allocation."""
+        mock_optimizer.create_double_buffer.return_value = Mock()
+        mock_sampler.return_value = Mock()
+        mock_applier.return_value = Mock()
+        mock_monitor.return_value = Mock()
+
+        self.orchestrator.prepare(self.model, self.data_loader)
+
+        self.assertEqual(
+            self.orchestrator.budget_allocation,
+            self.causal_engine.budget_allocation,
+        )
+
+
 class TestOrchestratorRunTraining(unittest.TestCase):
     """Tests for orchestrator.run_training() execution."""
     
@@ -440,6 +512,82 @@ class TestOrchestratorRunTraining(unittest.TestCase):
         self.orchestrator.run_training()
 
         self.orchestrator.weight_applier.request_skip_next_apply.assert_called_once()
+
+
+class TestUS3IntegrationPrepareBudget(unittest.TestCase):
+    """Integration tests for mandatory prepare flow and budget enforcement (T075-T077)."""
+
+    def setUp(self):
+        self.lora_engine = Mock()
+        self.causal_engine = Mock()
+        self.trainer = Mock()
+        self.causal_sampler = Mock()
+        self.config = CausalTrainingConfig()
+
+        self.model = Mock(spec=nn.Module)
+        self.data_loader = Mock()
+
+        self.causal_engine.identify_causal_paths.return_value = {
+            'attention': True,
+            'ffn': True,
+        }
+        self.causal_engine.allocate_budget.return_value = None
+        self.causal_engine.get_causal_summary.return_value = {'summary': 'ok'}
+
+        self.orchestrator = CausalTrainingOrchestrator(
+            self.lora_engine,
+            self.causal_engine,
+            self.trainer,
+            self.causal_sampler,
+            self.config,
+        )
+
+    def test_causal_training_blocked_without_prepare(self):
+        """T075: run_training must fail if prepare was not executed."""
+        with self.assertRaises(ValueError):
+            self.orchestrator.run_training()
+
+    @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
+    @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
+    @patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier')
+    @patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor')
+    def test_causal_training_succeeds_with_valid_prepared_budget(
+        self, mock_monitor, mock_applier, mock_sampler, mock_optimizer
+    ):
+        """T076: valid budget after prepare enables training execution."""
+        mock_optimizer.create_double_buffer.return_value = Mock()
+        mock_sampler.return_value = Mock()
+        mock_applier.return_value = Mock()
+        mock_monitor.return_value = Mock()
+
+        self.causal_engine.budget_allocation = {'attention': 500, 'ffn': 500}
+        self.trainer.train.return_value = {'loss': 0.1}
+
+        self.orchestrator.prepare(self.model, self.data_loader)
+        output = self.orchestrator.run_training()
+
+        self.assertEqual(output, {'loss': 0.1})
+        self.assertEqual(self.orchestrator.state, self.orchestrator.COMPLETED)
+
+    @patch('src.finetuner.causal_training_orchestrator.MemoryOptimizer')
+    @patch('src.finetuner.causal_training_orchestrator.BackgroundSampler')
+    @patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier')
+    @patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor')
+    def test_invalid_budget_blocks_run_with_clear_error(
+        self, mock_monitor, mock_applier, mock_sampler, mock_optimizer
+    ):
+        """T077: invalid budget must block run with explicit violation diagnostic."""
+        mock_optimizer.create_double_buffer.return_value = Mock()
+        mock_sampler.return_value = Mock()
+        mock_applier.return_value = Mock()
+        mock_monitor.return_value = Mock()
+
+        self.causal_engine.budget_allocation = {'attention': -1, 'ffn': 500}
+
+        with self.assertRaises(ValueError) as exc_info:
+            self.orchestrator.prepare(self.model, self.data_loader)
+
+        self.assertIn('Budget constraint violation', str(exc_info.exception))
 
 
 class TestOrchestratorDiagnostics(unittest.TestCase):
@@ -684,9 +832,9 @@ class TestOrchestratorStateTransitions(unittest.TestCase):
                 with patch('src.finetuner.causal_training_orchestrator.ContinuousWeightApplier'):
                     with patch('src.finetuner.causal_training_orchestrator.TrainingBudgetMonitor'):
                         # Setup mocks
-                        self.causal_engine.identify_causal_paths.return_value = {}
+                        self.causal_engine.identify_causal_paths.return_value = {'attention': True}
                         self.causal_engine.allocate_budget.return_value = None
-                        self.causal_engine.budget_allocation = {}
+                        self.causal_engine.budget_allocation = {'attention': 1}
                         self.causal_engine.get_causal_summary.return_value = {}
                         
                         model = Mock()
@@ -982,7 +1130,7 @@ class TestMultiPrecisionSupport(unittest.TestCase):
     
     def test_peft_config_respects_default_quantization_setting(self):
         """Test peft_config selection respects DEFAULT_QUANTIZATION setting."""
-        from src.settings.settings import Settings
+        from src.settings import Settings
         
         # Create settings with nf4_forced
         with patch.dict('os.environ', {'DEFAULT_QUANTIZATION': 'nf4_forced'}):
@@ -1066,7 +1214,7 @@ class TestNF4AutoDetection(unittest.TestCase):
     
     def test_nf4_detection_respects_forced_setting(self):
         """Test NF4_FORCED overrides VRAM-based detection."""
-        from src.settings.settings import Settings
+        from src.settings import Settings
         
         with patch.dict('os.environ', {'DEFAULT_QUANTIZATION': 'nf4_forced'}):
             settings = Settings(hf_token='test')

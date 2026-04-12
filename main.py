@@ -4,12 +4,15 @@ from src.utils.multiprocessing import configure_spawn_context
 # in notebook runtimes (e.g., Colab Linux kernels).
 _mp_setup = configure_spawn_context()
 
+import os
+from pathlib import Path
 import torch
 from peft import TaskType
-from src.settings.settings import settings
+from src.settings import SettingsFactory, CausalTrainingConfig
 from src.utils.logger import logger
 from src.utils.metrics import UnifiedEvaluator
 from src.utils.causal_sampler import CausalWeightSampler
+from src.finetuner.checkpoint_handler import CheckpointSelector
 from src.finetuner.data_loader import GLUEDataLoader
 from src.finetuner.lora_engine import FineTuningEngine as LoRAEngine
 from src.finetuner.causal_engine import (
@@ -19,7 +22,6 @@ from src.finetuner.causal_engine import (
 )
 from src.finetuner.nie_strategy import NIEBudgetAllocationStrategy
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
-from src.settings.settings import CausalTrainingConfig
 from transformers import AutoModelForSequenceClassification, Trainer, TrainingArguments
 
 logger.info(_mp_setup.message)
@@ -31,8 +33,32 @@ logger.info(
 )
 
 
+def _resume_enabled(policy: str) -> bool:
+    """Return True when runtime should attempt strict auto-resume."""
+    normalized = (policy or "").strip().lower()
+    return normalized in {"latest", "auto", "strict", "true", "1"}
+
+
+def _resolve_resume_checkpoint(output_dir: str, method: str) -> str | None:
+    """Resolve strict auto-resume checkpoint using last-known-good validation only."""
+    resume_policy = os.environ.get("RESUME_POLICY", "false")
+    if not _resume_enabled(resume_policy):
+        logger.info("Resume disabled by policy=%s", resume_policy)
+        return None
+
+    selected = CheckpointSelector.select_resume_checkpoint(
+        output_dir=Path(output_dir),
+        method=method,
+    )
+    logger.info("Strict resume selected checkpoint: %s", selected.path)
+    return str(selected.path)
+
+
 def main():
     logger.info("Initializing Fine-tuning Orchestrator...")
+    settings = SettingsFactory.create_settings(
+        override_values={"experiment_type": os.environ.get("EXPERIMENT_TYPE", "lora")}
+    )
 
     # 1. Setup Data and Evaluation
     loader = GLUEDataLoader(
@@ -70,6 +96,10 @@ def main():
             per_device_eval_batch_size=settings.batch_size,
             learning_rate=settings.learning_rate,
             remove_unused_columns=False,
+            save_strategy="steps",
+            save_steps=100,
+            save_total_limit=2,
+            load_best_model_at_end=False,
         )
 
         trainer = Trainer(
@@ -78,6 +108,11 @@ def main():
             train_dataset=train_ds,
             eval_dataset=eval_ds,
             compute_metrics=compute_metrics,
+        )
+
+        resume_checkpoint = _resolve_resume_checkpoint(
+            output_dir=training_args.output_dir,
+            method=settings.experiment_type,
         )
 
         if settings.execute_causal_engine:
@@ -169,9 +204,21 @@ def main():
             )
 
             orchestrator.prepare(model_lora, train_loader)
-            orchestrator.run_training()
+            orchestrator.run_training(resume_from_checkpoint=resume_checkpoint)
+            
+            # 4. Save trained LoRA adapter
+            output_dir = training_args.output_dir
+            trainer.save_model(output_dir)
+            lora_engine.save_lora_weights(output_dir)
+            logger.info(f"Saved trained LoRA adapter to: {output_dir}")
+            
             diagnostics = orchestrator.get_diagnostics()
             logger.info(f"Causal training diagnostics: {diagnostics}")
+            logger.info(
+                "Causal budget summary | allocation=%s utilization=%s",
+                diagnostics.get("budget_snapshot"),
+                diagnostics.get("budget_utilization"),
+            )
             weight_metrics = diagnostics.get("weight_application_metrics") or {}
             sampler_metrics = (diagnostics.get("async_sampler_status") or {}).get("metrics", {})
             logger.info(
@@ -181,9 +228,25 @@ def main():
                 weight_metrics.get("empty_buffer_skips"),
                 sampler_metrics.get("published_batches"),
             )
+            return {
+                "resume_checkpoint": resume_checkpoint,
+                "diagnostics": diagnostics,
+                "mode": "causal",
+            }
         else:
-            trainer.train()
+            trainer.train(resume_from_checkpoint=resume_checkpoint)
+            
+            # 4. Save trained LoRA adapter for standard LoRA path
+            output_dir = training_args.output_dir
+            trainer.save_model(output_dir)
+            lora_engine.save_lora_weights(output_dir)
+            logger.info(f"Saved trained LoRA adapter to: {output_dir}")
             logger.info("Causal engine disabled; completed standard LoRA training.")
+            return {
+                "resume_checkpoint": resume_checkpoint,
+                "diagnostics": None,
+                "mode": "standard_lora",
+            }
 
     except Exception as e:
         logger.error(f"Execution failed: {e}", exc_info=True)

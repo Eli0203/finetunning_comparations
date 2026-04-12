@@ -9,7 +9,7 @@ from transformers import TrainerState, TrainerControl, TrainingArguments
 
 from src.finetuner.causal_engine import CausalMonteCLoRAEngine
 from src.finetuner.causal_training_orchestrator import CausalTrainingOrchestrator
-from src.settings.settings import CausalTrainingConfig
+from src.settings import CausalTrainingConfig
 from src.utils.causal_sampler import CausalWeightSampler
 from src.utils.async_sampler import BackgroundSampler
 from src.utils.multiprocessing import RingBuffer

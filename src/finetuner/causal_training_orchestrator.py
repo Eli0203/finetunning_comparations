@@ -25,7 +25,7 @@ from src.utils.causal_sampler import CausalWeightSampler
 from src.utils.async_sampler import BackgroundSampler
 from src.utils.training_integrator import ContinuousWeightApplier, TrainingBudgetMonitor
 from src.utils.memory_manager import MemoryOptimizer
-from src.settings.settings import CausalTrainingConfig
+from src.settings import CausalTrainingConfig
 
 
 class WeightApplicationCallback(TrainerCallback):
@@ -261,6 +261,9 @@ class CausalTrainingOrchestrator:
             'causal': False,
             'resource': False,
         }
+        # Lifecycle readiness flag and budget snapshot (Phase 5 US3)
+        self._prepared: bool = False
+        self.budget_allocation: Optional[Dict[str, Any]] = None
         logger.info("CausalTrainingOrchestrator initialized in IDLE state")
     
     @property
@@ -282,6 +285,11 @@ class CausalTrainingOrchestrator:
         if value not in valid_states:
             raise ValueError(f"Invalid state: {value}")
         self._state = value
+
+    @property
+    def is_prepared(self) -> bool:
+        """Return True if prepare() has completed successfully."""
+        return self._prepared
 
     def _transition_to_sampling(self) -> None:
         """Transition PREPARING -> SAMPLING only after warm-up completion."""
@@ -417,6 +425,45 @@ class CausalTrainingOrchestrator:
             quantization_config=bnb_config,
         )
 
+    def _validate_budget_constraints(self, allocation: Dict[str, Any]) -> None:
+        """Validate budget: non-empty, non-negative values, sum within total budget.
+
+        Raises:
+            ValueError: With structured JSON diagnostics for any constraint violation.
+        """
+        import json
+
+        if not allocation:
+            diagnostics = json.dumps({
+                'error': 'EMPTY_BUDGET_ALLOCATION',
+                'message': 'Budget allocation must not be empty for causal mode',
+                'total_causal_budget': self.config.total_causal_budget,
+            })
+            raise ValueError(f"Budget constraint violation: {diagnostics}")
+
+        negative_keys = [
+            k for k, v in allocation.items()
+            if isinstance(v, (int, float)) and v < 0
+        ]
+        if negative_keys:
+            diagnostics = json.dumps({
+                'error': 'NEGATIVE_BUDGET_ALLOCATION',
+                'message': 'Budget allocations must be non-negative',
+                'violations': negative_keys,
+            })
+            raise ValueError(f"Budget constraint violation: {diagnostics}")
+
+        total = sum(v for v in allocation.values() if isinstance(v, (int, float)))
+        limit = self.config.total_causal_budget
+        if limit is not None and total > limit:
+            diagnostics = json.dumps({
+                'error': 'BUDGET_OVERFLOW',
+                'message': f'Allocated {total} exceeds total budget {limit}',
+                'allocated': total,
+                'limit': limit,
+            })
+            raise ValueError(f"Budget constraint violation: {diagnostics}")
+
     def _start_background_sampler(self) -> None:
         """Start async sampler process if available."""
         if self.async_sampler is not None and hasattr(self.async_sampler, 'start'):
@@ -507,6 +554,11 @@ class CausalTrainingOrchestrator:
             for path, budget in list(budget_summary.items())[:3]:
                 logger.debug(f"      {path}: {budget} samples")
 
+            # Validate and store budget allocation on the orchestrator
+            self._validate_budget_constraints(budget_summary)
+            self.budget_allocation = budget_summary
+            logger.info("[2/7] [OK] Budget constraints validated and allocation stored")
+
             # Notify the sampler so it can re-read the now-populated budget.
             # This eliminates the "no budget allocation" warning that fires when
             # the sampler is constructed before prepare() is called.
@@ -557,6 +609,10 @@ class CausalTrainingOrchestrator:
                 self.trainer.add_callback(self.interventional_callback)
             logger.info("[7/7] [OK] Callback registered")
             
+            # Mark preparation complete before state transition
+            self._prepared = True
+            logger.info("[OK] Orchestrator preparation complete — is_prepared=True")
+
             # Update state
             self._state = self.SAMPLING
             logger.info("=" * 60)
@@ -575,7 +631,53 @@ class CausalTrainingOrchestrator:
             logger.error(f"Failed to prepare orchestrator: {e}")
             raise
     
-    def run_training(self) -> Dict[str, Any]:
+    def register_callbacks(self) -> None:
+        """Register training callbacks. Must be called after prepare().
+
+        Raises:
+            RuntimeError: If called before prepare() has completed successfully.
+        """
+        import json
+
+        if not self._prepared:
+            diagnostics = json.dumps({
+                'error': 'CALLBACKS_BLOCKED_BEFORE_PREPARE',
+                'message': 'register_callbacks() requires prepare() to be called first',
+                'current_state': self._state,
+            })
+            raise RuntimeError(f"Orchestrator not prepared: {diagnostics}")
+
+        logger.info(
+            "Callbacks registered: weight_application=%s, interventional=%s",
+            self.weight_callback is not None,
+            self.interventional_callback is not None,
+        )
+
+    def _run_nie_warmup(self, warmup_steps: int) -> None:
+        """Run NIE warmup phase with explicit state transition and logging.
+
+        Performs the causal engine warmup needed to initialise NIE estimates
+        before main gradient-based training begins.  The transition is made
+        observable through bracketed log entries so it can be audited without
+        a debugger.
+        """
+        logger.info("=" * 60)
+        logger.info("NIE WARMUP: entering warmup phase (%d steps)", warmup_steps)
+        logger.info("NIE WARMUP: state=%s -> NIE_WARMUP", self._state)
+        try:
+            self.causal_engine.warmup(
+                self._model_ref,
+                self._train_loader_ref,
+                warmup_steps,
+            )
+            logger.info("NIE WARMUP: complete — returning to state=%s", self._state)
+        except Exception as exc:
+            logger.error("NIE WARMUP: failed with error: %s", exc)
+            raise
+        finally:
+            logger.info("=" * 60)
+
+    def run_training(self, resume_from_checkpoint: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute training with continuous causal weight application.
         
@@ -602,19 +704,19 @@ class CausalTrainingOrchestrator:
             if self.async_sampler is not None:
                 self.async_sampler.raise_if_failed()
 
-            # Optional warm-up before main training
+            # Optional NIE warm-up before main training (explicit state transition)
             if self.config.enable_warmup and self.config.warmup_steps:
-                logger.info(
-                    f"Warm-up enabled. Running {self.config.warmup_steps} warm-up steps before training."
-                )
-                self.causal_engine.warmup(
-                    self._model_ref,
-                    self._train_loader_ref,
-                    self.config.warmup_steps,
-                )
+                self._run_nie_warmup(self.config.warmup_steps)
             
-            # Execute training (weights applied via callback at each step)
-            training_output = self.trainer.train()
+            # Execute training (weights applied via callback at each step).
+            # Keep compatibility with trainer doubles that do not accept
+            # resume_from_checkpoint by only forwarding when explicitly set.
+            if resume_from_checkpoint is not None:
+                training_output = self.trainer.train(
+                    resume_from_checkpoint=resume_from_checkpoint
+                )
+            else:
+                training_output = self.trainer.train()
 
             # Marginal likelihood validation after training
             try:
@@ -733,6 +835,8 @@ class CausalTrainingOrchestrator:
         self.weight_applier = None
         self.budget_monitor = None
         self.weight_callback = None
+        self._prepared = False
+        self.budget_allocation = None
         self._state = self.IDLE
         logger.info("Orchestrator reset to IDLE state")
     

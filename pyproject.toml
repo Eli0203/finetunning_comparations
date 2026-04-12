@@ -38,4 +38,5 @@ dev = [
     "ruff>=0.15.6",
     "psutil>=5.9.0",  # For memory profiling and monitoring (T032)
     "pytest-mock>=3.14.0",
+    "pytest-cov>=7.1.0",
 ]

@@ -9,7 +9,13 @@ Coverage:
 
 import pytest
 from pydantic import ValidationError
-from src.settings.settings import Settings
+from src.settings import (
+    CausalLoraSettings,
+    LaplaceLoraSettings,
+    LoraSettings,
+    Settings,
+    SettingsFactory,
+)
 
 
 class TestTemperatureFieldValidation:
@@ -266,4 +272,280 @@ class TestPhase6SettingsIntegration:
         assert settings.enable_pg_pos is True
         assert settings.kfac_correlation is True
         assert settings.enable_interventional_weights is True
+
+
+class TestSettingsFactory:
+    """Phase 3 US1: fresh settings per run via factory."""
+
+    def test_settings_factory_creates_fresh_instances(self):
+        """T016: Two factory calls should return equal values but distinct objects."""
+        first = SettingsFactory.create_settings(
+            override_values={"hf_token": "test_token", "task_name": "mrpc"}
+        )
+        second = SettingsFactory.create_settings(
+            override_values={"hf_token": "test_token", "task_name": "mrpc"}
+        )
+
+        assert first is not second
+        assert first.task_name == second.task_name == "mrpc"
+        assert first.hf_token == second.hf_token == "test_token"
+
+    def test_settings_factory_reloads_env_file(self, env_file_fixture):
+        """T017: Factory should re-read updated env file content on each call."""
+        env_file_fixture.write_text("HF_TOKEN=token_a\nTASK_NAME=mrpc\n")
+        first = SettingsFactory.create_settings(env_file=env_file_fixture)
+
+        env_file_fixture.write_text("HF_TOKEN=token_b\nTASK_NAME=sst2\n")
+        second = SettingsFactory.create_settings(env_file=env_file_fixture)
+
+        assert first is not second
+        assert first.hf_token == "token_a"
+        assert second.hf_token == "token_b"
+        assert first.task_name == "mrpc"
+        assert second.task_name == "sst2"
+
+    def test_settings_fresh_per_run_isolation(self):
+        """T018: Sequential runs with conflicting engine flags remain isolated."""
+        run_a = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "test_token",
+                "execute_causal_engine": False,
+                "execute_laplace": True,
+            }
+        )
+        run_b = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "test_token",
+                "execute_causal_engine": True,
+                "execute_laplace": False,
+            }
+        )
+
+        assert run_a.execute_causal_engine is False
+        assert run_a.execute_laplace is True
+        assert run_b.execute_causal_engine is True
+        assert run_b.execute_laplace is False
+
+
+    # ============================================================================
+    # Phase 2 (Foundation) - T016-T018: SettingsFactory Tests (Failing-First TDD)
+    # ============================================================================
+
+    class TestSettingsFactoryFreshInstances:
+        """T016: SettingsFactory creates fresh instances without caching."""
+    
+        def test_settings_factory_creates_fresh_instances(self):
+            """T016: Two factory calls return different instances with same values."""
+            from src.settings import SettingsFactory
+            from pathlib import Path
+            import tempfile
+        
+            # Create a temporary .env file with test values
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+                f.write("HF_TOKEN=test_token\n")
+                f.write("MODEL_ID=bert-base-uncased\n")
+                f.write("TASK_NAME=mrpc\n")
+                env_file = Path(f.name)
+        
+            try:
+                # Create two instances from the same .env file
+                config1 = SettingsFactory.create_settings(env_file=env_file)
+                config2 = SettingsFactory.create_settings(env_file=env_file)
+            
+                # Different objects with same values
+                assert config1 is not config2, "Factory should return different instances"
+                assert config1.model_id == config2.model_id, "Values should be identical"
+                assert config1.task_name == config2.task_name, "Values should be identical"
+            finally:
+                import os
+                env_file.unlink()
+    
+        def test_settings_factory_override_values(self):
+            """T016: SettingsFactory.create_settings() respects override_values parameter."""
+            from src.settings import SettingsFactory
+            from pathlib import Path
+            import tempfile
+        
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False) as f:
+                f.write("HF_TOKEN=test_token\n")
+                f.write("MODEL_ID=bert-base-uncased\n")
+                env_file = Path(f.name)
+        
+            try:
+                # Create with overrides
+                config = SettingsFactory.create_settings(
+                    env_file=env_file,
+                    override_values={"model_id": "gpt2"}
+                )
+            
+                # Override should take effect
+                assert config.model_id == "gpt2", "Override value should be applied"
+            finally:
+                env_file.unlink()
+
+
+    class TestSettingsFactoryEnvFileReload:
+        """T017: SettingsFactory detects .env file changes between calls."""
+    
+        def test_settings_factory_reloads_env_file(self):
+            """T017: Change .env on disk; second factory call reads new values."""
+            from src.settings import SettingsFactory
+            from pathlib import Path
+            import tempfile
+            import time
+        
+            with tempfile.TemporaryDirectory() as tmpdir:
+                env_file = Path(tmpdir) / ".env"
+            
+                # Write initial values
+                env_file.write_text("HF_TOKEN=test_token\n")
+                env_file.write_text("HF_TOKEN=test_token\nMODEL_ID=bert-base-uncased\n")
+            
+                # First load
+                config1 = SettingsFactory.create_settings(env_file=env_file)
+                assert config1.model_id == "bert-base-uncased"
+            
+                # Change the .env file
+                time.sleep(0.1)  # Ensure file timestamp changes
+                env_file.write_text("HF_TOKEN=test_token\nMODEL_ID=roberta-base\n")
+            
+                # Second load should see new values
+                config2 = SettingsFactory.create_settings(env_file=env_file)
+                assert config2.model_id == "roberta-base", "Factory should reload updated .env"
+                assert config1.model_id == "bert-base-uncased", "Original config should be unchanged"
+
+
+    class TestSettingsFactoryIsolation:
+        """T018: Fresh settings per run; no cross-run configuration bleeding."""
+    
+        def test_settings_fresh_per_run_isolation(self):
+            """T018: Two runs with different engine flags are completely isolated."""
+            from src.settings import SettingsFactory
+            from pathlib import Path
+            import tempfile
+            import os
+        
+            # Save original env
+            original_causal = os.environ.get("EXECUTE_CAUSAL_ENGINE")
+        
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    env1 = Path(tmpdir) / ".env1"
+                    env2 = Path(tmpdir) / ".env2"
+                
+                    # Run A: Causal disabled
+                    env1.write_text("HF_TOKEN=token_a\nEXECUTE_CAUSAL_ENGINE=false\n")
+                    run_a = SettingsFactory.create_settings(env_file=env1)
+                
+                    # Run B: Causal enabled
+                    env2.write_text("HF_TOKEN=token_b\nEXECUTE_CAUSAL_ENGINE=true\n")
+                    run_b = SettingsFactory.create_settings(env_file=env2)
+                
+                    # Verify complete isolation
+                    assert run_a.execute_causal_engine is False, "Run A should have causal disabled"
+                    assert run_b.execute_causal_engine is True, "Run B should have causal enabled"
+                    assert run_a.hf_token == "token_a", "Run A should have its own token"
+                    assert run_b.hf_token == "token_b", "Run B should have its own token"
+            finally:
+                # Restore original env
+                if original_causal is not None:
+                    os.environ["EXECUTE_CAUSAL_ENGINE"] = original_causal
+                elif "EXECUTE_CAUSAL_ENGINE" in os.environ:
+                    del os.environ["EXECUTE_CAUSAL_ENGINE"]
+
+
+class TestSettingsFactoryExperimentDispatch:
+    """Phase 3B: experiment_type dispatch and algorithm guardrails."""
+
+    def test_factory_dispatches_lora_subclass(self):
+        settings = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "token",
+                "experiment_type": "lora",
+                "execute_causal_engine": False,
+                "execute_laplace": False,
+            }
+        )
+        assert isinstance(settings, LoraSettings)
+        assert settings.experiment_type == "lora"
+
+    def test_factory_dispatches_laplace_lora_subclass(self):
+        settings = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "token",
+                "experiment_type": "laplace_lora",
+                "execute_causal_engine": False,
+                "execute_laplace": True,
+            }
+        )
+        assert isinstance(settings, LaplaceLoraSettings)
+        assert settings.experiment_type == "laplace_lora"
+
+    def test_factory_dispatches_causal_lora_subclass(self):
+        settings = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "token",
+                "experiment_type": "causal_lora",
+                "execute_causal_engine": True,
+                "execute_laplace": False,
+            }
+        )
+        assert isinstance(settings, CausalLoraSettings)
+        assert settings.experiment_type == "causal_lora"
+
+    def test_missing_experiment_type_defaults_to_lora_with_warning(self):
+        with pytest.warns(UserWarning, match="defaulting to 'lora'"):
+            settings = SettingsFactory.create_settings(
+                override_values={
+                    "hf_token": "token",
+                    "execute_causal_engine": False,
+                    "execute_laplace": False,
+                }
+            )
+        assert isinstance(settings, LoraSettings)
+        assert settings.experiment_type == "lora"
+
+    def test_strict_mode_requires_experiment_type(self):
+        with pytest.raises(ValueError, match="experiment_type is required"):
+            SettingsFactory.create_settings(
+                override_values={
+                    "hf_token": "token",
+                    "execute_causal_engine": False,
+                    "execute_laplace": False,
+                },
+                strict_experiment_type=True,
+            )
+
+    def test_algorithm_mismatch_fails_fast(self):
+        with pytest.raises(ValueError, match="Algorithm mismatch"):
+            SettingsFactory.create_settings(
+                override_values={
+                    "hf_token": "token",
+                    "experiment_type": "causal_lora",
+                    "execute_causal_engine": False,
+                    "execute_laplace": False,
+                }
+            )
+
+    def test_canonical_artifact_root_builder(self):
+        settings = SettingsFactory.create_settings(
+            override_values={
+                "hf_token": "token",
+                "experiment_type": "laplace_lora",
+                "task_name": "sst2",
+                "run_id": "run-123",
+                "execute_causal_engine": False,
+                "execute_laplace": True,
+            }
+        )
+
+        root = str(settings.canonical_artifact_root).replace("\\", "/")
+        checkpoints = str(settings.checkpoints_dir).replace("\\", "/")
+        metrics = str(settings.metrics_dir).replace("\\", "/")
+        logs = str(settings.logs_dir).replace("\\", "/")
+
+        assert root.endswith("output/laplace_lora/sst2/run-123")
+        assert checkpoints.endswith("output/laplace_lora/sst2/run-123/checkpoints")
+        assert metrics.endswith("output/laplace_lora/sst2/run-123/metrics")
+        assert logs.endswith("output/laplace_lora/sst2/run-123/logs")
 
