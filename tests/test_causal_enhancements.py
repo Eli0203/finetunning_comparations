@@ -25,7 +25,7 @@ from src.finetuner.causal_engine import (
     TemperatureSoftmaxAllocationStrategy,
     _log_sum_exp,
 )
-from src.settings.settings import CausalTrainingConfig
+from src.settings import CausalTrainingConfig
 
 
 # ---------------------------------------------------------------------------

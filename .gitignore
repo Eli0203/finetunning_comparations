@@ -4,12 +4,32 @@
 # Keep the ignore file itself
 !.gitignore
 
-# Keep allowed source and test trees
+# Keep only allowed top-level artifacts
+!README.md
+!readme.md
+!.env.example
+
+# Keep only allowed source trees
 !src/
 !src/**
 !tests/
 !tests/**
+!venv/
+!venv/**
 
-# Keep README
-!README.md
-!readme.md
+# Never track real env files
+.env
+.env.*
+!.env.example
+
+# Never track caches or compiled artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# IDE and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

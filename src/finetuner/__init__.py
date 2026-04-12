@@ -12,6 +12,12 @@ from src.finetuner.causal_training_orchestrator import (
 
 from src.finetuner.nie_strategy import NIEBudgetAllocationStrategy
 
+from src.finetuner.checkpoint_handler import (
+	CheckpointValidator,
+	CheckpointSelector,
+	CheckpointCandidate,
+)
+
 try:
 	from src.finetuner.causal_training_orchestrator import InterventionalWeightCallback
 except ImportError:
@@ -25,4 +31,7 @@ __all__ = [
 	'WeightApplicationCallback',
 	'NIEBudgetAllocationStrategy',
 	'InterventionalWeightCallback',
+	'CheckpointValidator',
+	'CheckpointSelector',
+	'CheckpointCandidate',
 ]

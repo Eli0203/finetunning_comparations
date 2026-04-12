@@ -29,7 +29,9 @@ def test_ring_buffer_spawn_safe_put_get_integration() -> None:
     proc = ctx.Process(target=_spawn_writer, args=(buffer,))
     proc.start()
 
-    deadline = time.time() + 10.0
+    # Full-suite runs on Windows can delay spawn startup; allow extra headroom
+    # to avoid false negatives from transient process scheduling latency.
+    deadline = time.time() + 30.0
     while proc.exitcode is None and time.time() < deadline:
         proc.join(timeout=0.1)
 
