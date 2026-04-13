@@ -16,10 +16,14 @@
 !tests/**
 !venv/
 !venv/**
+!notebooks/
+!notebooks/**
 
 # Never track real env files
 .env
 .env.*
+finetuning.log
+notebooks/finetuning.log
 !.env.example
 
 # Never track caches or compiled artifacts
@@ -27,6 +31,13 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.venv/
+dist/
+build/
+*.egg-info/
+*.log
+*.tmp
+*.swp
 
 # IDE and OS noise
 .vscode/

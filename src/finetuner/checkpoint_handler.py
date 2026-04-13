@@ -383,12 +383,12 @@ class CheckpointSelector:
     def select_resume_checkpoint(
         output_dir: Path,
         method: str = "lora",
-    ) -> CheckpointCandidate:
+    ) -> CheckpointCandidate | None:
         """Select newest fully validated last-known-good checkpoint for strict auto-resume.
 
-        Raises:
-            RuntimeError: When no valid resumable checkpoint exists. Exception message
-                is a JSON structured diagnostic payload.
+        Returns:
+            CheckpointCandidate when a resumable checkpoint exists, otherwise None
+            to signal clean-start behavior.
         """
         output_dir = output_dir.resolve()
         selected = CheckpointSelector.select_latest_resumable_checkpoint(
@@ -398,18 +398,19 @@ class CheckpointSelector:
         if selected is None:
             diagnostic = _build_structured_diagnostic(
                 error_type="resume_no_valid_checkpoint",
-                level="error",
+                level="warning",
                 context={
                     "output_dir": str(output_dir),
                     "method": method,
                 },
-                message="No fully validated last-known-good checkpoint is available for resume.",
+                message="No fully validated last-known-good checkpoint is available; starting clean.",
                 resolution=(
                     "Complete at least one stage boundary successfully and persist an atomic "
                     "last-known-good checkpoint before retrying resume."
                 ),
             )
-            raise RuntimeError(json.dumps(diagnostic))
+            logger.warning(json.dumps(diagnostic))
+            return None
 
         pointer = RecoveryCheckpointManager.load_last_known_good(output_dir)
         if pointer is not None:

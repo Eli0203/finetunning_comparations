@@ -54,7 +54,7 @@ class SettingsFactory:
     @staticmethod
     def _load_env_file(env_file: Path) -> Dict[str, Any]:
         """Load values from an env file and normalize them to Settings fields."""
-        env_values = dotenv_values(env_file)
+        env_values = dotenv_values(env_file, encoding="utf-8")
         return SettingsFactory._normalize_env_values(dict(env_values))
 
     @staticmethod
