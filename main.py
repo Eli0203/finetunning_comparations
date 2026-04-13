@@ -5,6 +5,7 @@ from src.utils.multiprocessing import configure_spawn_context
 _mp_setup = configure_spawn_context()
 
 import os
+import json
 from pathlib import Path
 import torch
 from peft import TaskType
@@ -50,36 +51,78 @@ def _resolve_resume_checkpoint(output_dir: str, method: str) -> str | None:
         output_dir=Path(output_dir),
         method=method,
     )
+    if selected is None:
+        logger.info("Strict resume found no valid checkpoint; starting from clean state.")
+        return None
+
     logger.info("Strict resume selected checkpoint: %s", selected.path)
     return str(selected.path)
 
 
+def _build_success_result(
+    *,
+    mode: str,
+    settings,
+    output_dir: str,
+    resume_checkpoint: str | None,
+    diagnostics: dict | None,
+) -> dict:
+    """Build a normalized success payload for notebook/runtime callers."""
+    return {
+        "status": "success",
+        "mode": mode,
+        "experiment_type": settings.experiment_type,
+        "task": settings.task_name,
+        "output_dir": output_dir,
+        "resume_checkpoint": resume_checkpoint,
+        "diagnostics": diagnostics,
+    }
+
+
+def _build_failure_result(exc: Exception, settings=None) -> dict:
+    """Build a normalized failure payload for fail-fast orchestration."""
+    return {
+        "status": "failure",
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "experiment_type": getattr(settings, "experiment_type", None),
+        "task": getattr(settings, "task_name", None),
+    }
+
+
+def _persist_adapter_artifacts(*, trainer: Trainer, model, output_dir: str) -> None:
+    """Persist both trainer and PEFT adapter artifacts using supported APIs."""
+    trainer.save_model(output_dir)
+    model.save_pretrained(output_dir)
+
+
 def main():
     logger.info("Initializing Fine-tuning Orchestrator...")
-    settings = SettingsFactory.create_settings(
-        override_values={"experiment_type": os.environ.get("EXPERIMENT_TYPE", "lora")}
-    )
-
-    # 1. Setup Data and Evaluation
-    loader = GLUEDataLoader(
-        settings.model_id,
-        settings.task_name,
-        max_length=settings.max_seq_length,
-    )
-    evaluator = UnifiedEvaluator(settings.task_name)
-
-    train_ds, eval_ds, _ = loader.get_datasets(train_split="train")
-
-    train_loader = loader.get_loader("train", settings.batch_size)
-
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        logits_t = torch.tensor(logits)
-        labels_t = torch.tensor(labels)
-        return evaluator.compute_all(logits_t, labels_t)
-
-    # 2. Strategy: LoRA + Causal orchestration
+    settings = None
     try:
+        settings = SettingsFactory.create_settings(
+            override_values={"experiment_type": os.environ.get("EXPERIMENT_TYPE", "lora")}
+        )
+
+        # 1. Setup Data and Evaluation
+        loader = GLUEDataLoader(
+            settings.model_id,
+            settings.task_name,
+            max_length=settings.max_seq_length,
+        )
+        evaluator = UnifiedEvaluator(settings.task_name)
+
+        train_ds, eval_ds, _ = loader.get_datasets(train_split="train")
+
+        train_loader = loader.get_loader("train", settings.batch_size)
+
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            logits_t = torch.tensor(logits)
+            labels_t = torch.tensor(labels)
+            return evaluator.compute_all(logits_t, labels_t)
+
+        # 2. Strategy: LoRA + Causal orchestration
         base_model = AutoModelForSequenceClassification.from_pretrained(settings.model_id)
         lora_engine = LoRAEngine(
             TaskType.SEQ_CLS, base_model,
@@ -206,10 +249,13 @@ def main():
             orchestrator.prepare(model_lora, train_loader)
             orchestrator.run_training(resume_from_checkpoint=resume_checkpoint)
             
-            # 4. Save trained LoRA adapter
+            # 4. Save trained LoRA adapter artifacts
             output_dir = training_args.output_dir
-            trainer.save_model(output_dir)
-            lora_engine.save_lora_weights(output_dir)
+            _persist_adapter_artifacts(
+                trainer=trainer,
+                model=model_lora,
+                output_dir=output_dir,
+            )
             logger.info(f"Saved trained LoRA adapter to: {output_dir}")
             
             diagnostics = orchestrator.get_diagnostics()
@@ -228,28 +274,39 @@ def main():
                 weight_metrics.get("empty_buffer_skips"),
                 sampler_metrics.get("published_batches"),
             )
-            return {
-                "resume_checkpoint": resume_checkpoint,
-                "diagnostics": diagnostics,
-                "mode": "causal",
-            }
+            return _build_success_result(
+                mode="causal",
+                settings=settings,
+                output_dir=output_dir,
+                resume_checkpoint=resume_checkpoint,
+                diagnostics=diagnostics,
+            )
         else:
             trainer.train(resume_from_checkpoint=resume_checkpoint)
             
-            # 4. Save trained LoRA adapter for standard LoRA path
+            # 4. Save trained LoRA adapter artifacts for standard LoRA path
             output_dir = training_args.output_dir
-            trainer.save_model(output_dir)
-            lora_engine.save_lora_weights(output_dir)
+            _persist_adapter_artifacts(
+                trainer=trainer,
+                model=model_lora,
+                output_dir=output_dir,
+            )
             logger.info(f"Saved trained LoRA adapter to: {output_dir}")
             logger.info("Causal engine disabled; completed standard LoRA training.")
-            return {
-                "resume_checkpoint": resume_checkpoint,
-                "diagnostics": None,
-                "mode": "standard_lora",
-            }
+            return _build_success_result(
+                mode="standard_lora",
+                settings=settings,
+                output_dir=output_dir,
+                resume_checkpoint=resume_checkpoint,
+                diagnostics=None,
+            )
 
     except Exception as e:
         logger.error(f"Execution failed: {e}", exc_info=True)
+        failure = _build_failure_result(e, settings=settings)
+        if os.environ.get("MAIN_FAILURE_MODE", "raise").strip().lower() == "return":
+            return failure
+        raise RuntimeError(json.dumps(failure)) from e
 
 
 if __name__ == "__main__":

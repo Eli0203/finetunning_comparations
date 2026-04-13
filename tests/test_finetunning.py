@@ -481,8 +481,8 @@ class TestCheckpointRecoveryResume:
         selected = CheckpointSelector.select_resume_checkpoint(temp_dir, method="lora")
         assert selected.checkpoint_name == "checkpoint-300"
 
-    def test_resume_fails_with_structured_diagnostics_when_no_valid_resumable(self, temp_dir):
-        """T117: explicit structured diagnostic when no valid resumable checkpoint exists."""
+    def test_resume_returns_none_when_no_valid_resumable(self, temp_dir):
+        """T117: clean-start behavior when no valid resumable checkpoint exists."""
         from src.finetuner.checkpoint_handler import CheckpointSelector, RecoveryCheckpointManager
 
         partial_ckpt = self._create_valid_checkpoint(temp_dir, 100)
@@ -493,15 +493,8 @@ class TestCheckpointRecoveryResume:
             reason="failed atomic commit",
         )
 
-        with pytest.raises(RuntimeError) as exc_info:
-            CheckpointSelector.select_resume_checkpoint(temp_dir, method="lora")
-
-        diagnostic = json.loads(str(exc_info.value))
-        assert diagnostic["error_type"] == "resume_no_valid_checkpoint"
-        assert diagnostic["level"] == "error"
-        assert "timestamp" in diagnostic
-        assert "context" in diagnostic
-        assert "message" in diagnostic
+        selected = CheckpointSelector.select_resume_checkpoint(temp_dir, method="lora")
+        assert selected is None
 
 
 class TestStrictResumeRuntimeAndNotebook:
