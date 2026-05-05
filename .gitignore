@@ -1,6 +1,6 @@
 # Ignore everything by default
 *
-
+/*
 # Keep the ignore file itself
 !.gitignore
 

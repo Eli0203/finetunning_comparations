@@ -19,8 +19,11 @@ dependencies = [
     "tiktoken>=0.7.0",
     "ipywidgets>=8.1.0",
     "matplotlib>=3.9.0",
+    "seaborn>=0.13.0",
     "numpy>=2.0.0",           # Explicitly move to 2.0 to align all C-headers
     "pytest>=9.0.2",
+    "streamlit>=1.28.0",      # For interactive demos
+    "safetensors>=0.4.0",     # For loading model weights
 ]
 
 [[tool.uv.index]]
